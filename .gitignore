@@ -1,0 +1,44 @@
+# ---- dependencies & build output (regenerable, hundreds of MB) ----
+node_modules/
+dist/
+.electron-builder-cache/
+.electron-dl/
+.npm-cache/
+.tools/
+.cache/
+
+# ---- scratch from the original build experiments ----
+.dotnet-home/
+.dotnet-test/
+
+# ---- REAL MEETING DATA — never commit this ----
+# Contains recorded audio, transcripts and notes of actual meetings
+# (client names, project details). Keep it local or in a private store only.
+meeting notes/
+
+# ---- crash logs / temp ----
+*.log
+debug.log
+*.part
+*.tmp
+
+# ---- local-only notes and unrelated work ----
+# BUILD-STATE.md is an internal build log (machine paths, hardware, environment
+# notes). It stays on disk but must not be published.
+BUILD-STATE.md
+# notes and scripts from a different, unrelated feature
+dsh-voice-agent/
+VOICE-AGENT-TASK.md
+
+# ---- compiled capture tool ----
+# Rebuild with: npm run capture:build  (needs msys2 gcc)
+.cap/capture.exe
+
+# ---- OS junk ----
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# NOTE: assets/models/*.onnx (1.5 MB) and its LICENSE file ARE tracked on purpose:
+# the app cannot run without the segmentation model, and the license must ship with it.
+

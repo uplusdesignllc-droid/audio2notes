@@ -1,0 +1,192 @@
+"use strict";
+/* Meeting folder layout + ffmpeg mixing + artifact writing. */
+const { spawn } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+
+const ffmpegPath = require("./ffmpegPath").ffmpegPath();
+
+function runFfmpeg(args) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(ffmpegPath, args, { stdio: "ignore", windowsHide: true });
+    p.on("error", reject);
+    p.on("close", (code) => (code === 0 ? resolve() : reject(new Error("ffmpeg exit " + code))));
+  });
+}
+
+function pad(n) { return String(n).padStart(2, "0"); }
+
+function newMeetingDir(root) {
+  const d = new Date();
+  const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  const dir = path.join(root, stamp);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/**
+ * Mix system+mic wavs to a single 16 kHz mono wav for transcription.
+ * @param {{system?:string, mic?:string}} sources
+ * @param {string} outWav
+ */
+async function mixToTranscription(sources, outWav) {
+  const inputs = [];
+  const filters = [];
+  let i = 0;
+  for (const key of ["system", "mic"]) {
+    if (sources[key] && fs.existsSync(sources[key])) {
+      inputs.push("-i", sources[key]);
+      filters.push(`[${i}:a]volume=1.0[a${i}]`);
+      i++;
+    }
+  }
+  if (i === 0) throw new Error("no audio captured");
+  let map;
+  if (i === 1) {
+    map = "[a0]";
+  } else {
+    const names = Array.from({ length: i }, (_, k) => `[a${k}]`).join("");
+    filters.push(`${names}amix=inputs=${i}:normalize=0[mix]`);
+    map = "[mix]";
+  }
+  await runFfmpeg([
+    "-y", "-v", "error",
+    ...inputs,
+    "-filter_complex", filters.join(";"),
+    "-map", map,
+    "-ar", "16000", "-ac", "1",
+    "-c:a", "pcm_s16le", outWav,
+  ]);
+}
+
+function fmtTime(sec) {
+  if (sec == null) return "";
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${pad(m)}:${pad(s)}`;
+}
+
+/* ---- speaker labeling (two-track: you vs remote) ------------------------- */
+
+function words(t) {
+  return String(t || "").toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w.length > 1);
+}
+
+/** Fraction of the shorter text's words present in the longer one. */
+function wordOverlap(a, b) {
+  const wa = new Set(words(a));
+  const wb = new Set(words(b));
+  if (!wa.size || !wb.size) return 0;
+  const [small, big] = wa.size <= wb.size ? [wa, wb] : [wb, wa];
+  let hit = 0;
+  for (const w of small) if (big.has(w)) hit++;
+  return hit / small.size;
+}
+
+/** Chunks overlap in time? (shorter chunk inside or crossing the other's window) */
+function timeOverlap(a, b, slack = 2.5) {
+  const s = Math.max(a.start, b.start);
+  const e = Math.min(a.end, b.end);
+  if (e > s) return true; // actual overlap
+  return Math.abs(a.start - b.start) <= slack; // near-miss within slack
+}
+
+/**
+ * Merge two transcribed tracks into one labeled timeline.
+ * @param {Array} micChunks    transcription of the microphone ("you")
+ * @param {Array} remoteChunks transcription of system loopback ("remote")
+ * @returns {Array} chunks: [{text,start,end,speaker,speakerName}]
+ *
+ * Echo handling: a mic chunk that time-overlaps a remote chunk AND is largely the
+ * same words is assumed to be the remote voice leaking into the mic — the mic copy
+ * is dropped, the remote copy is kept.
+ */
+function mergeTracks(micChunks, remoteChunks) {
+  const kept = [];
+  for (const rc of remoteChunks || []) {
+    if (!rc.text || !rc.text.trim()) continue;
+    kept.push({ text: rc.text, start: rc.start, end: rc.end, speaker: "remote", speakerName: "远端" });
+  }
+  for (const mc of micChunks || []) {
+    if (!mc.text || !mc.text.trim()) continue;
+    const echo = (remoteChunks || []).some((rc) => {
+      if (!rc.text || !rc.text.trim()) return false;
+      return timeOverlap(mc, rc) && wordOverlap(mc.text, rc.text) >= 0.5;
+    });
+    if (echo) continue;
+    kept.push({ text: mc.text, start: mc.start, end: mc.end, speaker: "you", speakerName: "你" });
+  }
+  kept.sort((a, b) => (a.start || 0) - (b.start || 0));
+  return kept;
+}
+
+/** Flatten labeled chunks into the plain transcript text fed to the LLM. */
+function transcriptText(chunks) {
+  return (chunks || [])
+    .map((c) => `[${c.speakerName || (c.speaker === "you" ? "你" : "远端")}] ${c.text}`)
+    .join("\n");
+}
+
+/** Flatten labeled chunks into Chinese text (translated field, falls back to original). */
+function transcriptZhText(chunks) {
+  return (chunks || [])
+    .map((c) => {
+      const who = c.speakerName || (c.speaker === "you" ? "你" : "远端");
+      const t = c.translated && c.translated.trim() ? c.translated : c.text;
+      return `[${who}] ${t}`;
+    })
+    .join("\n");
+}
+
+function transcriptMarkdown(transcript, zh = false) {
+  const lines = [
+    `# Transcript${zh ? "（中文）" : ""}`,
+    ``,
+    zh
+      ? `> 中文译文（Ollama 自动翻译，原文见 transcript.md）。`
+      : `> Auto-generated by Audio2Notes (local Whisper).`,
+    ``,
+  ];
+  for (const c of transcript.chunks || []) {
+    const t = fmtTime(c.start);
+    const who = c.speakerName || (c.speaker === "you" ? "你" : "远端");
+    const text = zh && c.translated && c.translated.trim() ? c.translated : c.text;
+    lines.push(`**[${t}] ${who}:** ${text}`);
+  }
+  if (!(transcript.chunks || []).length && transcript.text) {
+    lines.push(zh ? transcript.zh || transcript.text : transcript.text);
+  }
+  return lines.join("\n");
+}
+
+function writeArtifacts(dir, { transcript, notes, meta }) {
+  fs.writeFileSync(path.join(dir, "transcript.txt"), transcript.text, "utf8");
+  fs.writeFileSync(path.join(dir, "transcript.json"), JSON.stringify(transcript, null, 2), "utf8");
+  fs.writeFileSync(path.join(dir, "transcript.md"), transcriptMarkdown(transcript), "utf8");
+  fs.writeFileSync(path.join(dir, "notes.md"), notes.text, "utf8");
+  if (transcript.zh || (transcript.chunks || []).some((c) => c.translated)) {
+    const zh = transcriptZhText(transcript.chunks);
+    fs.writeFileSync(path.join(dir, "transcript.zh.txt"), zh, "utf8");
+    fs.writeFileSync(path.join(dir, "transcript.zh.md"), transcriptMarkdown(transcript, true), "utf8");
+    fs.writeFileSync(
+      path.join(dir, "transcript.zh.json"),
+      JSON.stringify({ ...transcript, chunks: transcript.chunks }, null, 2),
+      "utf8"
+    );
+  }
+  if (notes.zh) {
+    fs.writeFileSync(path.join(dir, "notes.zh.md"), notes.zh, "utf8");
+  }
+  fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify(meta, null, 2), "utf8");
+}
+
+module.exports = {
+  newMeetingDir,
+  mixToTranscription,
+  writeArtifacts,
+  transcriptMarkdown,
+  transcriptText,
+  transcriptZhText,
+  mergeTracks,
+  fmtTime,
+};

@@ -1,0 +1,58 @@
+{
+  "name": "audio-to-notes",
+  "version": "1.0.0",
+  "description": "Audio2Notes — record meetings (system audio + mic) and auto-generate notes, independent of meeting apps.",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "prepackage": "node -e \"if(!require('fs').existsSync('.cap/capture.exe')){console.error('\\n缺少 .cap/capture.exe —— 请先运行: npm run capture:build （需要 msys2 gcc）\\n');process.exit(1)}\"",
+    "package": "electron-builder --win portable",
+    "capture:build": "gcc -O2 -Wall -DINITGUID -o .cap/capture.exe .cap/capture.c -lole32 -luuid -lpropsys"
+  },
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "packageManager": "npm@11.17.0",
+  "overrides": {
+    "sharp": "0.33.5"
+  },
+  "dependencies": {
+    "@xenova/transformers": "^2.17.2",
+    "ffmpeg-static": "^5.3.0",
+    "sharp": "0.33.5",
+    "sherpa-onnx-node": "^1.13.8"
+  },
+  "devDependencies": {
+    "electron": "^44.0.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.audio2notes.app",
+    "productName": "Audio2Notes",
+    "files": [
+      "src/**",
+      "renderer/**",
+      "assets/**",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/ffmpeg-static/**",
+      "node_modules/@img/**",
+      "node_modules/sherpa-onnx-*/**",
+      "assets/models/**"
+    ],
+    "npmRebuild": false,
+    "electronDownload": {
+      "cache": "C:/Users/lma/Documents/Cline/Workflows/audio to notes/.electron-builder-cache"
+    },
+    "extraResources": [
+      {
+        "from": ".cap/capture.exe",
+        "to": "bin/capture.exe"
+      }
+    ],
+    "win": {
+      "target": "portable"
+    }
+  }
+}

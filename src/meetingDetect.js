@@ -1,0 +1,85 @@
+"use strict";
+/* Meeting-app detection: decide whether a call is starting or has ended, from
+ * the WASAPI session list that capture.exe reports.
+ *
+ * Verified on this machine (2026-09-11): while a process plays audio its session
+ * reports state=Active, and Inactive once it stops — e.g. powershell.exe playing
+ * a WAV was Active for the whole playback and Inactive before/after.
+ *
+ * Pure by design (no timers, no Electron) so the start/stop rules are testable.
+ *
+ * Defaults are deliberately asymmetric:
+ *   autoStop  = on   — the recording was started by a human; noticing the call
+ *                      ended simply avoids recording silence for hours.
+ *   autoStart = off  — starting to record a meeting by itself is a privacy
+ *                      decision, so it must be switched on explicitly. */
+
+const DEFAULT_RULE = {
+  enabled: true,
+  autoStart: false,
+  autoStop: true,
+  apps: ["ms-teams.exe", "teams.exe", "zoom.exe", "webexmta.exe", "CptHost.exe", "slack.exe", "Discord.exe"],
+  startAfterSec: 15,   // watched app must be Active this long before auto-start
+  stopAfterSec: 90,    // and quiet this long before auto-stop
+};
+
+function normalizeRule(rule) {
+  const r = Object.assign({}, DEFAULT_RULE, rule || {});
+  r.apps = (r.apps || DEFAULT_RULE.apps).map((a) => String(a).toLowerCase());
+  return r;
+}
+
+/** Is a watched meeting app currently producing audio? */
+function activeMeetingApp(sessions, rule) {
+  const r = normalizeRule(rule);
+  const hit = (sessions || []).find(
+    (s) => s && s.state === "Active" && r.apps.includes(String(s.name || "").toLowerCase())
+  );
+  return hit ? hit.name : null;
+}
+
+/**
+ * @param {Object} state  { activeSince:number|null, inactiveSince:number|null }
+ * @param {Object} input  { sessions, recording, recordingAutoStarted, now, rule }
+ * @returns {{actions:Array<{type:string,app?:string}>, next:Object, activeApp:string|null}}
+ */
+function evaluate(state, input) {
+  const s = Object.assign({ activeSince: null, inactiveSince: null }, state || {});
+  const rule = normalizeRule(input.rule);
+  const now = input.now;
+  const actions = [];
+  const activeApp = activeMeetingApp(input.sessions, rule);
+  const next = Object.assign({}, s);
+
+  if (!rule.enabled) return { actions, next: { activeSince: null, inactiveSince: null }, activeApp };
+
+  if (activeApp) {
+    next.inactiveSince = null;
+    if (s.activeSince == null) {
+      next.activeSince = now;
+    } else if (
+      !input.recording &&
+      rule.autoStart &&
+      now - s.activeSince >= rule.startAfterSec * 1000
+    ) {
+      actions.push({ type: "start", app: activeApp });
+      next.activeSince = now; // do not re-fire while the same call continues
+    }
+  } else {
+    next.activeSince = null;
+    if (input.recording) {
+      if (s.inactiveSince == null) {
+        next.inactiveSince = now;
+      } else if (rule.autoStop && now - s.inactiveSince >= rule.stopAfterSec * 1000) {
+        actions.push({ type: "stop", reason: "meeting-app-quiet" });
+        next.inactiveSince = now;
+      }
+    } else {
+      next.inactiveSince = null;
+    }
+  }
+
+  return { actions, next, activeApp };
+}
+
+module.exports = { DEFAULT_RULE, normalizeRule, activeMeetingApp, evaluate };
