@@ -1,6 +1,6 @@
 {
   "name": "audio-to-notes",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Audio2Notes — record meetings (system audio + mic) and auto-generate notes, independent of meeting apps.",
   "main": "src/main.js",
   "scripts": {

@@ -260,7 +260,12 @@
 
       <div class="card">
         <h2>翻译（自动转成中文）</h2>
-        <label class="check"><input type="checkbox" id="cfg-translate-enabled" checked /> 转写与笔记自动翻译成中文</label>
+        <label class="check"><input type="checkbox" id="cfg-translate-enabled" checked /> 笔记（摘要）自动翻译成中文（总开关）</label>
+        <label class="check"><input type="checkbox" id="cfg-translate-transcript" /> 翻译整篇转写稿（很慢：155 分钟的会议约需 90 分钟；只翻摘要约 4 分钟）</label>
+        <p class="hint">
+          转写稿翻译默认<b>关闭</b>，因为它实测是整条流水线里最慢的一步：155 分钟的会议有 2663 段、约 13 万字符英文，产出约 9 万 token，受本机 16.5 token/s 的生成速度限制约需 <b>90 分钟</b>（加大批量没有用，瓶颈是生成速度）。只翻摘要约 <b>4 分钟</b>。
+          需要中文转写稿时再勾选它；不勾选时会议记录里的 <code>meta.json</code> 会写明 <code>translationSkipped: "transcript-disabled"</code>，并且流水线里会明确提示，不会默默跳过。
+        </p>
         <label>翻译引擎
           <select id="cfg-translate-engine">
             <option value="ollama">Ollama（本地）</option>

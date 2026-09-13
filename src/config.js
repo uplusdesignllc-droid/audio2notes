@@ -21,7 +21,16 @@ const DEFAULTS = {
     openai: { baseUrl: "https://api.openai.com/v1", apiKey: "", model: "gpt-4o-mini" },
   },
   translation: {
-    enabled: true,            // auto-translate to Simplified Chinese
+    enabled: true,            // master switch: auto-translate the NOTES to Simplified Chinese
+    /* Translate the whole transcript too? Default OFF, on measured grounds.
+     * Measured on a real 155-minute meeting: 2663 segments / ~130k English chars
+     * -> ~90k output tokens, which at this machine's 16.5 tok/s is a ~90 minute
+     * floor (28.7 segments/min). The cost is generation-throughput bound, so
+     * batching more aggressively does not fix it — it made transcript translation
+     * the dominant cost of the whole pipeline (~44 min to transcribe 18 664 s of
+     * audio, ~93 min to translate it). The notes (~7k chars) translate in ~4 min
+     * instead, and translateNotes() still honours translation.enabled. */
+    transcript: false,
     engine: "ollama",         // ollama | openai
     ollama: { baseUrl: "http://127.0.0.1:11434", model: "" },
     openai: { baseUrl: "https://api.openai.com/v1", apiKey: "", model: "gpt-4o-mini" },

@@ -148,6 +148,7 @@ async function loadConfig() {
   refreshMeetingStatus();
 
   $("cfg-translate-enabled").checked = !!cfg.translation.enabled;
+  $("cfg-translate-transcript").checked = !!cfg.translation.transcript;
   $("cfg-translate-engine").value = cfg.translation.engine || "ollama";
   $("cfg-trans-ollama-url").value = cfg.translation.ollama.baseUrl;
   $("cfg-trans-ollama-model").value = cfg.translation.ollama.model;
@@ -186,6 +187,7 @@ $("btn-save").addEventListener("click", async () => {
     },
     translation: {
       enabled: $("cfg-translate-enabled").checked,
+      transcript: $("cfg-translate-transcript").checked,
       engine: $("cfg-translate-engine").value,
       ollama: { baseUrl: $("cfg-trans-ollama-url").value.trim(), model: $("cfg-trans-ollama-model").value.trim() },
       openai: {

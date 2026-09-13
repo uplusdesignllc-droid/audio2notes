@@ -88,6 +88,28 @@ function looksChinese(text) {
   return letters > 0 && cjk / letters > 0.15;
 }
 
+/**
+ * Why transcript translation will not run — null when it will.
+ * Single source of truth for the gate, so main.js cannot drift from it, and the
+ * reason is machine-readable because a skipped translation must never be silent:
+ *   translation-disabled  translation.enabled (master switch) is off
+ *   transcript-disabled   translation.transcript is off — the default, because
+ *                         translating a 155-minute transcript measured ~90 min
+ *   already-chinese       the transcript is already Simplified Chinese
+ * Flags are checked before content, and a disabled flag means NO network call is
+ * made at all (measured: 0 fetch calls).
+ * @param {object} cfg         config (translation.*)
+ * @param {{text?:string}} transcript
+ * @returns {"translation-disabled"|"transcript-disabled"|"already-chinese"|null}
+ */
+function transcriptSkipReason(cfg, transcript) {
+  const t = (cfg && cfg.translation) || {};
+  if (!t.enabled) return "translation-disabled";
+  if (!t.transcript) return "transcript-disabled";
+  if (looksChinese(transcript && transcript.text)) return "already-chinese";
+  return null;
+}
+
 function parseNumbered(res) {
   const map = new Map();
   const re = /^\s*(\d{1,4})\s*[.)、:：]?\s*(.+)$/m;
@@ -147,4 +169,4 @@ If the text is already Chinese, output it unchanged.
 If the input contains numbered lines (e.g. "1. ..."), translate each line and output the same numbers, one translated line per number, with no extra text, no explanations, no headers.
 Keep names, numbers, and technical terms in their original form where that is more natural.`;
 
-module.exports = { translateChunks, translateText, looksChinese, parseNumbered, SYSTEM_TRANSLATOR };
+module.exports = { translateChunks, translateText, looksChinese, transcriptSkipReason, parseNumbered, SYSTEM_TRANSLATOR };

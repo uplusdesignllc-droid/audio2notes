@@ -277,28 +277,49 @@ async function processQueuedDir(job) {
   const profile = await currentProfile();
   const dir = job.dir;
   const pick = (names) => names.map((n) => path.join(dir, n)).find((p) => fs.existsSync(p) && fs.statSync(p).size > 4096);
-  let audioPath = pick(["mixed.opus", "mixed.wav"]);
-  if (!audioPath) {
-    const sources = {};
-    const s = pick(["system.opus", "system.wav"]);
-    const m = pick(["mic.opus", "mic.wav"]);
-    if (s) sources.system = s;
-    if (m) sources.mic = m;
-    if (!Object.keys(sources).length) throw new Error("找不到音频文件");
-    audioPath = path.join(dir, "mixed.wav");
-    await meetings.mixToTranscription(sources, audioPath);
-  }
+
+  // Keep the SAME two-track pipeline the recorder uses: transcribing system and
+  // mic separately (then merging with echo de-duplication) is what produces the
+  // 你 / 远端 speaker split. Mixing them down first would silently lose it.
+  const systemAudio = pick(["system.opus", "system.wav"]);
+  const micAudio = pick(["mic.opus", "mic.wav"]);
+  const hasTwoTracks = !!(systemAudio && micAudio);
 
   send("pipeline", { phase: "transcribing", message: `转写排队的会议（${profile.model.replace("Xenova/whisper-", "")}）…`, progress: 0 });
   models.assertReady({ cacheDir: config.modelCacheDir(cfg), model: profile.model, autoDownload: cfg.whisper.autoDownload });
-  const t = await transcribe.transcribeFile({
-    wavFile: audioPath,
-    model: profile.model,
-    cacheDir: config.modelCacheDir(cfg),
-    endpoint: cfg.whisper.endpoint || "https://huggingface.co/",
-  });
-  const chunks = (t.chunks || []).map((c) => ({ ...c, speaker: "unknown", speakerName: "说话人" }));
-  const transcript = { chunks, text: meetings.transcriptText(chunks), durationSec: job.durationSec || 0 };
+
+  let chunks;
+  let text;
+  let audioStats = null;
+  if (hasTwoTracks) {
+    const t = await transcribeSources({ system: systemAudio, mic: micAudio }, cfg, (p) => {
+      if (p && p.status === "progress" && typeof p.progress === "number") {
+        send("pipeline", { phase: "transcribing", progress: p.progress, message: "转写中…" });
+      }
+    });
+    chunks = t.chunks;
+    text = t.text;
+    audioStats = t.audioStats || null;
+  } else {
+    let audioPath = pick(["mixed.opus", "mixed.wav"]);
+    if (!audioPath) {
+      const only = systemAudio || micAudio;
+      if (!only) throw new Error("找不到音频文件");
+      audioPath = path.join(dir, "mixed.wav");
+      await meetings.mixToTranscription(systemAudio ? { system: only } : { mic: only }, audioPath);
+    }
+    const t = await transcribe.transcribeFile({
+      wavFile: audioPath,
+      model: profile.model,
+      cacheDir: config.modelCacheDir(cfg),
+      endpoint: cfg.whisper.endpoint || "https://huggingface.co/",
+    });
+    chunks = (t.chunks || []).map((c) => ({ ...c, speaker: "unknown", speakerName: "说话人" }));
+    text = t.text || meetings.transcriptText(chunks);
+    audioStats = audioStatsOf(t.audio);
+  }
+
+  const transcript = { chunks, text, durationSec: job.durationSec || 0, audioStats };
   send("transcript", transcript);
   const translated = await translateTranscript(transcript, cfg);
   const notes = await summarize.summarize(transcript.text, cfg, (p) =>
@@ -314,12 +335,16 @@ async function processQueuedDir(job) {
       queued: true,
       queuedAt: job.createdAt,
       whisperModel: profile.model,
+      audioStats,
       notesProvider: notes.provider,
       notesFallbackReason: notes.fallbackReason || null,
       notesMapReduce: !!notes.mapReduce,
       notesWarnings: notes.warnings || [],
       detailLevel: cfg.notes.detailLevel || "standard",
       translated,
+      // why the transcript is not in Chinese (null when it was translated):
+      // "transcript-disabled" | "translation-disabled" | "already-chinese"
+      translationSkipped: translated ? null : transcript.translationSkipped || null,
       translationEngine: translated ? cfg.translation.engine : null,
       powerMode: profile.effective,
       engine: profile.engine.id,
@@ -337,12 +362,19 @@ async function runQueue(reason) {
   if (!profile.runNow && reason === "auto") return { skipped: "当前模式下不自动转写", profile };
 
   queueRunning = true;
+  /* A long backfill must count as "busy" for the whole run: otherwise the
+   * lifecycle watchdog sees an idle app and quits ~15 minutes in, killing the
+   * transcription mid-flight (found by actually queueing a 155-minute meeting).
+   * It also makes record:start / file:transcribe refuse to run concurrently. */
+  rec.busy = true;
+  touchActivity();
   const results = [];
   try {
     for (;;) {
       const q = readQueue();
       const job = jobQueue.nextJob(q, 3);
       if (!job) break;
+      touchActivity();
       send("queue", { type: "start", dir: job.dir, remaining: jobQueue.size(q) });
       try {
         const r = await processQueuedDir(job);
@@ -358,6 +390,8 @@ async function runQueue(reason) {
     }
   } finally {
     queueRunning = false;
+    rec.busy = false;
+    touchActivity();
     send("queue", { type: "idle", queue: readQueue().jobs });
   }
   return { ok: true, results, queue: readQueue().jobs };
@@ -454,6 +488,26 @@ function stopPolling() {
 
 /* ---- transcription of the captured sources ------------------------------- */
 
+/**
+ * Fold the per-track long-silence numbers reported by transcribe.transcribeFile
+ * into one record-shaped object. NO SILENT DEGRADATION: whatever audio was cut
+ * must be visible in the meeting record, not only in a console line.
+ */
+function audioStatsOf(...tracks) {
+  const list = (tracks || []).filter((a) => a && typeof a === "object" && a.track);
+  if (!list.length) return null;
+  const sum = (k) => Math.round(list.reduce((s, a) => s + (Number(a[k]) || 0), 0) * 10) / 10;
+  return {
+    totalSec: sum("totalSec"),
+    silentSec: sum("silentSec"),
+    silenceSkippedSec: sum("silenceSkippedSec"),
+    speechKeptSec: sum("speechKeptSec"),
+    segments: list.reduce((s, a) => s + (Number(a.segments) || 0), 0),
+    cutRuns: list.reduce((s, a) => s + (Number(a.cutRuns) || 0), 0),
+    tracks: list,
+  };
+}
+
 async function transcribeSources(sources, cfg, onProgress) {
   const model = cfg.whisper.model;
   const cacheDir = config.modelCacheDir(cfg);
@@ -476,13 +530,39 @@ async function transcribeSources(sources, cfg, onProgress) {
       chunks.push({ text: c.text, start: c.start, end: c.end, speaker: "unknown", speakerName: "说话人" });
     }
   }
-  return { chunks, text: meetings.transcriptText(chunks) };
+  /* Long-silence skipping is reported per track and folded into the record, so
+   * the meeting folder states exactly how much audio never reached the model. */
+  const audioStats = audioStatsOf(mic && mic.audio, sys && sys.audio);
+  if (audioStats && audioStats.silenceSkippedSec > 0) {
+    send("pipeline", {
+      phase: "transcribing",
+      message: `跳过长静音 ${audioStats.silenceSkippedSec}s（${audioStats.cutRuns} 段），送入模型 ${audioStats.speechKeptSec}s / 共 ${audioStats.totalSec}s`,
+    });
+  }
+  return { chunks, text: meetings.transcriptText(chunks), audioStats };
 }
 
 /* ---- translation helper -------------------------------------------------- */
 
 async function translateTranscript(transcript, cfg) {
-  if (!cfg.translation.enabled || translate.looksChinese(transcript.text)) return false;
+  /* Transcript translation needs BOTH flags. It defaults OFF because it is the
+   * dominant cost of the pipeline: on a real 155-minute meeting, translating the
+   * 2663 segments measured ~93 minutes (28.7 segments/min, ~90k output tokens at
+   * 16.5 tok/s) versus ~44 minutes to transcribe 18 664 s of audio and ~4 minutes
+   * to translate the notes. Generation-throughput bound, so batching harder does
+   * not help. When it is skipped the reason is recorded on the transcript (which
+   * the callers copy into meta.json) and announced — never silently dropped. */
+  const skip = translate.transcriptSkipReason(cfg, transcript);
+  if (skip) {
+    transcript.translationSkipped = skip;
+    if (skip === "transcript-disabled") {
+      send("pipeline", {
+        phase: "translating",
+        message: "跳过转写稿翻译：保留原文以节省时间（155 分钟的会议约需 90 分钟）。如需中文转写稿，请在「设置 → 翻译」勾选「翻译整篇转写稿」后重新处理。",
+      });
+    }
+    return false;
+  }
   send("pipeline", { phase: "translating", message: "Translating transcript to Chinese…" });
   await translate.translateChunks(transcript.chunks, cfg, (p) => {
     send("pipeline", {
@@ -617,6 +697,7 @@ ipcMain.handle("record:stop", async () => {
       createdAt: new Date().toISOString(),
       durationSec,
       sources: Object.keys(sources),
+      audioStats: transcript.audioStats || null,
       whisperModel: cfg.whisper.model,
       notesProvider: notes.provider,
       notesFallbackReason: notes.fallbackReason || null,
@@ -625,6 +706,9 @@ ipcMain.handle("record:stop", async () => {
       notesWarnings: notes.warnings || [],
       detailLevel: cfg.notes.detailLevel || "standard",
       translated,
+      // see translate.transcriptSkipReason — a skipped transcript translation is
+      // recorded, never silent
+      translationSkipped: translated ? null : transcript.translationSkipped || null,
       translationEngine: translated ? cfg.translation.engine : null,
       speakerLabels: ["你", "远端"],
     };
@@ -689,7 +773,8 @@ ipcMain.handle("file:transcribe", async (_e, filePath) => {
       endpoint: cfg.whisper.endpoint || "https://huggingface.co/",
     });
     const chunks = (r.chunks || []).map((c) => ({ ...c, speaker: "unknown", speakerName: "说话人" }));
-    const transcript = { chunks, text: meetings.transcriptText(chunks), durationSec: 0 };
+    const audioStats = audioStatsOf(r.audio);
+    const transcript = { chunks, text: meetings.transcriptText(chunks), durationSec: 0, audioStats };
     send("transcript", transcript);
     const translated = await translateTranscript(transcript, cfg);
     send("pipeline", { phase: "summarizing", message: "Writing notes…" });
@@ -703,6 +788,7 @@ ipcMain.handle("file:transcribe", async (_e, filePath) => {
       meta: {
         createdAt: new Date().toISOString(),
         source: filePath,
+        audioStats,
         whisperModel: cfg.whisper.model,
         notesProvider: notes.provider,
         notesFallbackReason: notes.fallbackReason || null,
@@ -711,6 +797,9 @@ ipcMain.handle("file:transcribe", async (_e, filePath) => {
         notesWarnings: notes.warnings || [],
         detailLevel: cfg.notes.detailLevel || "standard",
         translated,
+        // see translate.transcriptSkipReason — a skipped transcript translation is
+        // recorded, never silent
+        translationSkipped: translated ? null : transcript.translationSkipped || null,
         translationEngine: translated ? cfg.translation.engine : null,
       },
     });
