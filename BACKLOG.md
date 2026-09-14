@@ -439,6 +439,12 @@ Separate, small bug found while looking: **`speaker-rows` appears twice as an id
 `renderer/index.html` (lines 93 and 167). Duplicate ids are invalid HTML and `$("speaker-rows")`
 silently returns only the first; one of the two needs a different id.
 
+Impact is worse than "invalid HTML", confirmed 2026-09-14: line 93 is the meeting-detail speaker
+panel and line 167 is the Settings 「说话人识别模型」 card, and `$()` returns the first in document
+order — so `loadModels()` (`renderer/app.js:658`) writes the voiceprint model row **into the meeting
+speaker panel**, and the Settings card is never populated at all. Both are silent. Fixed by renaming
+the Settings element to `speaker-model-rows`.
+
 **The owner's requested shape (2026-09-14):** a **popup/modal**, shown **automatically at the
 moment manual input is needed**, carrying an explicit **「不需要更改参会人」** option so it can be
 dismissed in one click. Deliberately NOT a settings screen and not the row-editing list that
@@ -460,6 +466,11 @@ is real:
 Recommendation: **(a) with the skip option**, because it is the only variant that pays for itself
 in transcript quality; fall back to (b)/(c) if it turns out to nag.
 
+**DECIDED by the owner 2026-09-14: variant (a) — pop up at stop.** Implemented in this same
+session (see §7 for the resulting files). The owner's exact requested shape is honoured: the popup
+fires automatically, and 「不需要更改参会人」 is a first-class one-click dismissal alongside a
+persisted 「以后停止时不要再问我」 preference.
+
 ⚠ **Checked 2026-09-14 — option 2 is NOT available out of the box, which changes how much
 variant (a) is worth.** `@xenova/transformers` 2.17.2 has **no `initial_prompt` support at all**
 (no matches anywhere in the package). Its ASR pipeline builds `forced_decoder_ids` itself from
@@ -477,14 +488,66 @@ similarity threshold. It needs no model work at all, it fixes exactly the mangle
 the opposite one: an over-eager corrector invents names that were never said, so it must be
 conservative and should say what it changed.
 
+⚠ **Deferred 2026-09-14, after checking the actual distances — the tradeoff does not work out at a
+sane threshold.** Against the two known manglings:
+
+| pair | lengths | edit distance | first letter | Soundex |
+|---|---|---|---|---|
+| `bristol` → `crystal` | 7 / 7 | **3** | differs (b/c) | `B623` / `C623` |
+| `restalwest` → `restylwest` | 9 / 9 | 2 | same | — |
+
+`restylwest` is caught by an edit-distance ≤2 rule, but `bristol → crystal` needs ≤3, and at
+distance 3 with a 7-letter token almost any word matches something. Phonetic matching does better
+on that particular pair only because their Soundex codes differ in the first letter alone — which
+means the rule would have to ignore initial consonants, exactly the thing that keeps such a rule
+from inventing names. So the pass is **not implemented**: the honest next step is to measure
+precision and recall on the 120 s reference clip (which has a known ground-truth transcript) and
+only ship a rule that survives that measurement. A rename-only UI that never edits the transcript
+cannot corrupt anything, which is why P6 ships without it.
+
 Net effect on the trigger question: variant (a) still gives the user the names earlier and lets
 the naming rows be prefilled, but its ASR payoff is no longer free, so (a) versus (b)/(c) is now
 mostly about *when the user is asked* rather than about transcript quality.
 
 **Observability gap noticed during the 2026-09-14 acceptance run:** `meta.stopReason` is only ever
-set to `"max-duration"`. The meeting that ending via the meeting-app-quiet rule recorded nothing,
+set to `"max-duration"`. The meeting that ended via the meeting-app-quiet rule recorded nothing,
 so which mechanism stopped a recording has to be inferred from timings. The renderer knows the
 reason when it calls `record:stop` for an auto-stop-request — pass it through and record it.
+
+**Implementation contract designed 2026-09-14, NOT yet written** (an implementation subagent was
+stopped before it wrote anything, so nothing exists on disk yet). The owner decided variant (a) —
+pop up at stop. Keep this shape:
+
+- **New module `src/participants.js`**, dependency-free CommonJS, **no `electron` import** so it is
+  unit-testable under plain `node`. Exports `createParticipantGate({ timeoutMs = 300000, now })`
+  returning `{ request({dir,title,suggested,reason}) -> {id,prefill}, wait(id) -> Promise<{names,
+  source}>, answer(id, payload) -> boolean, pending() -> string[], abandon(id) }`, where `source` is
+  one of `"answered" | "unchanged" | "timeout" | "cancelled"`. `answer` accepts `{names}` (edit),
+  `{unchanged:true}` (the one-click dismissal → resolves with the prefill) or `{cancel:true}`.
+  `wait` must never reject; `answer` on an unknown or already-answered id returns `false` and never
+  throws; one outstanding request per `dir` (a second `request` returns the same id); every timer is
+  `.unref()`ed so it cannot hold the process open. `suggested` is sanitised defensively: trimmed,
+  non-empty, case-insensitively deduped, ≤80 chars each, ≤40 entries.
+- **Wiring in `src/main.js`:** request the gate immediately after capture stops (before the slow
+  mixing/transcription) and `await gate.wait(id)` **exactly once, immediately before notes
+  generation**. Emit a new `participants` event to the renderer carrying `{id,dir,title,prefill,
+  reason}`. Persist `meta.participants` plus `participantsSource` and `participantsAskedAt`; omit
+  `participants` entirely when the list is empty rather than writing `[]` as if it were an answer.
+  ⚠ Add these fields to every named-field whitelist that would otherwise drop them — this codebase
+  has already lost a field that way once (`jobQueue.add()`, see §7).
+- **IPC:** `participants:answer`, `participants:edit` (user-initiated re-edit of an existing
+  meeting: `reason:"manual"`, persists, and deliberately does **not** regenerate the notes — that
+  stays the existing manual 「重新生成笔记」 action) and `participants:status`; mirrored in
+  `src/preload.js` as `participantsAnswer` / `participantsEdit` / `participantsStatus` /
+  `onParticipants`. On window `closed`, `abandon(id)` any pending request so the pipeline cannot
+  wedge.
+- **Modal UX:** overlay + centred card; editable name inputs with remove buttons and an 「添加一位」;
+  primary 「保存」; secondary 「不需要更改参会人」; checkbox 「以后停止时不要再问我」. Enter saves;
+  **Escape triggers 「不需要更改参会人」, not cancel** — a recording must not silently lose its
+  roster. Never use blocking `prompt()`/`confirm()`.
+- **Bundle in the two small bugs** listed in this section (the duplicate `speaker-rows` id and the
+  dead `meta.stopReason`) — they sit in the same files, so splitting them would only create
+  conflicts.
 
 ## 3. Investigated and rejected (with the real reasons)
 - **Recording straight to Ogg/Opus** — loses "a hard kill still yields a decodable file" and
