@@ -435,6 +435,23 @@ static int cmd_record(const char* kind, const char* path, double seconds, long l
             }
             written += pad_bytes;
             written_frames += pad;
+            /* The padded frames ARE elapsed real time, so they must advance the LEVEL odometer
+             * too. Otherwise a long silence leaves the status file's last line frozen at the
+             * last loud value, and the app's pollLevels() reads that stale line as speech —
+             * which silently defeats the silence watchdog that is supposed to flag a
+             * "forgot to stop the recording" session after 10 quiet minutes. Emit one line
+             * per completed window (a big gap can span many at once), 64-bit-wide so the
+             * DWORD frames_in_level + long long pad can't overflow, then narrow. */
+            long long acc = (long long)frames_in_level + pad;
+            long long nwin = acc / (long long)frames_per_level;
+            frames_in_level = (DWORD)(acc % (long long)frames_per_level);
+            while (nwin-- > 0) {
+              double lvl = peak * 100.0;
+              if (lvl < last_level) lvl = lvl * 0.3 + last_level * 0.7;
+              last_level = lvl;
+              emit("LEVEL %d\n", (int)(lvl > 100 ? 100 : lvl));
+              peak = 0;
+            }
           } else {
             limited = 1; /* the fuse tripped while padding */
           }
