@@ -12,10 +12,12 @@
  *   autoStop  = on   — the recording was started by a human; noticing the call
  *                      ended simply avoids recording silence for hours.
  *                      Precondition: auto-stop only applies if a watched app was
- *                      actually seen (state=Active) during this recording. A
- *                      recording that never heard one (in-person meeting, browser
- *                      call, voice memo) is never stopped by this rule; the
- *                      silence watchdog covers its "nobody spoke" case.
+ *                      seen ACTIVE FOR AT LEAST startAfterSec (15 s) during this
+ *                      recording — not merely glimpsed. A recording that never
+ *                      heard one (in-person meeting, browser call, voice memo) is
+ *                      never stopped by this rule, and a one-second notification
+ *                      sound from a chat app on the watched list cannot fake one.
+ *                      The silence watchdog covers the "nobody spoke" case.
  *   autoStart = off  — starting to record a meeting by itself is a privacy
  *                      decision, so it must be switched on explicitly. */
 
@@ -60,7 +62,22 @@ function evaluate(state, input) {
 
   if (activeApp) {
     next.inactiveSince = null;
-    next.sawWatchedApp = input.recording; // latch: set only while a watched app is seen AND recording; cleared when not recording
+    /* The latch must not be set by a BLIP. Two chat apps are on the watched list
+     * (slack.exe, Discord.exe), and a single notification sound makes their
+     * session Active for a second or two. Under the old rule that alone latched
+     * the recording, after which 90 s of quiet would stop it — i.e. a Slack ping
+     * could truncate a recording of something else entirely, which is exactly the
+     * false stop the latch was added to prevent.
+     * So require the app to have been CONTINUOUSLY active for startAfterSec (the
+     * same debounce autoStart already uses) before it counts as evidence that a
+     * call happened. A real call is active for minutes, so this costs nothing; a
+     * ping cannot reach it. activeSince is reset whenever no watched app is
+     * active, so pings can never accumulate toward the threshold either. */
+    if (!input.recording) {
+      next.sawWatchedApp = false;
+    } else if (s.activeSince != null && now - s.activeSince >= rule.startAfterSec * 1000) {
+      next.sawWatchedApp = true; // once earned, the latch holds for this recording
+    } // otherwise: keep whatever the latch already was
     if (s.activeSince == null) {
       next.activeSince = now;
     } else if (
