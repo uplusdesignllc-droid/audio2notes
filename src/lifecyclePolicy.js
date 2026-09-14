@@ -14,6 +14,7 @@ function evaluate(state, cfg, now) {
     {
       recording: false,
       busy: false,
+      recStartMs: null,   // when the current recording started (null when not recording)
       lastActivity: now,
       lastLoudAt: now,
       warnedAt: null,     // when the silence warning was first raised
@@ -27,6 +28,7 @@ function evaluate(state, cfg, now) {
   const silenceMin = typeof as.silenceMin === "number" ? as.silenceMin : 10;
   const forceStopAfterMin = typeof as.forceStopAfterMin === "number" ? as.forceStopAfterMin : 5;
   const minFreeDiskGB = typeof as.minFreeDiskGB === "number" ? as.minFreeDiskGB : 2;
+  const maxElapsedMin = typeof as.maxElapsedMin === "number" ? as.maxElapsedMin : 480;
   const autoStopEnabled = as.enabled !== false;
   const autoQuitAfterMin = typeof cfg.autoQuitAfterMin === "number" ? cfg.autoQuitAfterMin : 15;
 
@@ -42,6 +44,17 @@ function evaluate(state, cfg, now) {
       next.diskWarned = true;
       actions.push({ type: "stop", reason: "disk" });
       return { actions, next };
+    }
+
+    /* Hard length ceiling: like the disk fuse it cannot be negotiated away —
+     * a recording that accidentally never stops must stop on time alone.
+     * 0 = disabled. */
+    if (maxElapsedMin > 0 && typeof s.recStartMs === "number") {
+      const elapsedMin = (now - s.recStartMs) / 60000;
+      if (elapsedMin >= maxElapsedMin) {
+        actions.push({ type: "stop", reason: "max-duration", elapsedMin: Math.round(elapsedMin) });
+        return { actions, next };
+      }
     }
 
     if (autoStopEnabled && !s.suppressed) {

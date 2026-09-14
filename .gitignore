@@ -10,6 +10,8 @@ dist/
 # ---- scratch from the original build experiments ----
 .dotnet-home/
 .dotnet-test/
+# verification scratch: test wav/opus fixtures, probe scripts, model Modelfiles
+.scratch/
 
 # ---- REAL MEETING DATA — never commit this ----
 # Contains recorded audio, transcripts and notes of actual meetings

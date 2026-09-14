@@ -6,8 +6,13 @@
  * mono (~10.8 MB/hour vs ~691 MB/hour for a 48 kHz stereo capture WAV).
  *
  * Safety rule: an original WAV is ONLY deleted after its replacement passed
- * three checks — ffmpeg exit 0, output non-trivial (>1 KB), and a second
- * end-to-end decode pass. Any failure keeps the original and reports why. */
+ * four checks — ffmpeg exit 0, output non-trivial (>1 KB), a second
+ * end-to-end decode pass (yielding a duration via `-progress`), and a
+ * source-vs-output duration match within max(1% of source, 0.5 s). Any failure
+ * keeps the original and reports why. Encode output always lands in a
+ * `.tmp` sibling first and is only `fs.rename`d to the final name once every
+ * check has passed, so a crash mid-encode can never leave a file with the
+ * final name but partial contents. */
 
 const { spawn } = require("child_process");
 const fs = require("fs");
@@ -57,6 +62,8 @@ function runFfmpeg(args) {
 }
 
 function encodeArgs(preset, src, out) {
+  // `-f <ext>` forces the muxer — required when `out` does not carry the
+  // canonical extension (e.g. the atomic `.tmp` sibling).
   const head = ["-y", "-v", "error", "-i", src, "-vn", "-map", "0:a:0"];
   if (preset.codec === "libopus") {
     return [
@@ -64,6 +71,7 @@ function encodeArgs(preset, src, out) {
       "-ar", "16000", "-ac", "1",
       "-c:a", "libopus", "-b:a", `${preset.bitrateKbps}k`,
       "-application", "voip", "-vbr", "on",
+      "-f", preset.ext,
       out,
     ];
   }
@@ -71,13 +79,80 @@ function encodeArgs(preset, src, out) {
     ...head,
     "-ar", String(preset.sampleRate || 24000), "-ac", "1",
     "-c:a", "libmp3lame", "-b:a", `${preset.bitrateKbps}k`,
+    "-f", preset.ext,
     out,
   ];
 }
 
-/** Full decode pass — proves the container/stream is readable end to end. */
-function verifyAudio(file) {
-  return runFfmpeg(["-y", "-v", "error", "-i", file, "-f", "null", "-"]);
+/**
+ * Single decode pass that BOTH proves the file is end-to-end decodable
+ * (ffmpeg exit 0) AND returns the decoded length in seconds. Returns `null`
+ * on any failure (spawn error, non-zero exit, or missing/unparseable
+ * progress output). Reads the final `out_time_us=` value from the
+ * `-progress` file, falling back to `out_time=HH:MM:SS.micro` if the
+ * microsecond field is absent. The progress file is a caller-scoped name in
+ * the same directory (guaranteed same volume), cleaned up on every exit.
+ */
+async function probeDurationSec(file) {
+  const tag = Date.now().toString(36) + "-" + Math.floor(Math.random() * 1e9).toString(36);
+  let progress = null;
+  try { progress = path.join(path.dirname(file) || ".", ".probe-" + tag + ".txt"); }
+  catch { return null; }
+
+  const ok = await new Promise((resolve) => {
+    let settled = false;
+    const settle = (v) => { if (!settled) { settled = true; resolve(v); } };
+    try {
+      const p = spawn(
+        ffmpegPath,
+        ["-y", "-v", "error", "-i", file, "-f", "null", "-", "-progress", progress],
+        { stdio: "ignore", windowsHide: true },
+      );
+      p.on("error", () => settle(false));
+      p.on("close", (code) => settle(code === 0));
+    } catch { settle(false); }
+  });
+
+  let content = null;
+  if (ok) {
+    try { content = fs.readFileSync(progress, "utf-8"); } catch { content = null; }
+  }
+  try { fs.unlinkSync(progress); } catch { /* ignore */ }
+  if (!ok || !content) return null;
+
+  let lastUs = null;
+  let lastTimeSec = null;
+  for (const line of content.split(/\r?\n/)) {
+    const mUs = line.match(/^out_time_us=(\d+)\s*$/);
+    if (mUs) { lastUs = parseInt(mUs[1], 10); continue; }
+    const mT = line.match(/^out_time=(\d+):(\d+):(\d+)[.;](\d+)\s*$/);
+    if (mT) {
+      const digits = mT[4].length;
+      const frac = digits ? parseInt(mT[4], 10) / Math.pow(10, digits) : 0;
+      lastTimeSec = parseInt(mT[1], 10) * 3600 + parseInt(mT[2], 10) * 60 + parseInt(mT[3], 10) + frac;
+    }
+  }
+  if (lastUs !== null && Number.isFinite(lastUs) && lastUs >= 0) return lastUs / 1e6;
+  if (lastTimeSec !== null && Number.isFinite(lastTimeSec) && lastTimeSec >= 0) return lastTimeSec;
+  return null;
+}
+
+/**
+ * Tolerance for the source-vs-output duration match. A truncated Opus that
+ * still decodes is shorter than its source; anything beyond this slack is a
+ * data-loss signal and must block the delete.
+ */
+function durationTolerance(sourceSec) {
+  const s = (sourceSec != null && Number.isFinite(sourceSec) && sourceSec > 0) ? sourceSec : 0;
+  return Math.max(0.01 * s, 0.5);
+}
+
+/** true iff both durations are finite and their difference is within tolerance. */
+function durationsMatch(sourceSec, outputSec) {
+  if (sourceSec == null || outputSec == null) return false;
+  if (!Number.isFinite(sourceSec) || !Number.isFinite(outputSec)) return false;
+  if (sourceSec < 0 || outputSec < 0) return false;
+  return Math.abs(sourceSec - outputSec) <= durationTolerance(sourceSec);
 }
 
 function isWavName(name) {
@@ -121,39 +196,69 @@ function wavInfo(file) {
 }
 
 /**
- * Compress one WAV. Returns { from, to, before, after }. Throws on failure —
- * in which case the original is always still on disk.
+ * Compress one WAV atomically. Returns { from, to, before, after, reused }.
+ * Throws on failure — the original is always still on disk, and no `.tmp`
+ * sibling is left behind.
+ *
+ * Reuse: if the final file already exists, it is reused only when ALL four
+ * checks pass — size > 1 KB, end-to-end decodable, and a duration that
+ * matches the source within max(1% of source, 0.5 s). Otherwise the stale
+ * file is deleted and a fresh encode is produced from the source.
+ *
+ * Fresh encode: output is written to `<out>.tmp` (same directory as `out`
+ * so `fs.renameSync` is atomic on the same volume). Every check runs against
+ * the `.tmp`. Only after ALL checks pass is the file renamed to the final
+ * name and the source deleted (unless `opts.keepWav`). Any failure removes
+ * the `.tmp` and leaves the source untouched.
  */
 async function archiveFile(srcPath, opts = {}) {
   const preset = resolvePreset(opts);
   const before = fs.statSync(srcPath).size;
   const out = srcPath.replace(/\.wav$/i, "." + preset.ext);
 
+  let sourceDur = null;
+  if (isWavName(path.basename(srcPath))) {
+    const info = wavInfo(srcPath);
+    if (info && Number.isFinite(info.durationSec)) sourceDur = info.durationSec;
+  }
+  if (sourceDur == null) sourceDur = await probeDurationSec(srcPath);
+
   if (fs.existsSync(out)) {
     const st = fs.statSync(out);
-    if (st.size > 1024 && (await verifyAudio(out))) {
+    let outDur = null;
+    if (st.size > 1024) outDur = await probeDurationSec(out);
+    const passes = st.size > 1024
+      && outDur !== null
+      && (sourceDur === null || durationsMatch(sourceDur, outDur));
+    if (passes) {
       if (!opts.keepWav) fs.rmSync(srcPath, { force: true });
       return { from: srcPath, to: out, before, after: st.size, reused: true };
     }
     fs.rmSync(out, { force: true }); // unusable leftover — re-encode from scratch
   }
 
-  const ok = await runFfmpeg(encodeArgs(preset, srcPath, out));
-  if (!ok || !fs.existsSync(out)) {
+  const tmp = out + ".tmp";
+  try {
+    const ok = await runFfmpeg(encodeArgs(preset, srcPath, tmp));
+    if (!ok || !fs.existsSync(tmp)) throw new Error("ffmpeg 编码失败");
+    const after = fs.statSync(tmp).size;
+    if (after <= 1024) throw new Error(`输出异常（${after} 字节）`);
+    const outDur = await probeDurationSec(tmp);
+    if (outDur === null) throw new Error("输出校验失败（无法解码）");
+    if (sourceDur !== null && !durationsMatch(sourceDur, outDur)) {
+      throw new Error(
+        `输出校验失败（时长不一致：源 ${sourceDur.toFixed(2)} s，输出 ${outDur.toFixed(2)} s，`
+        + `容忍 ±${durationTolerance(sourceDur).toFixed(2)} s）`
+      );
+    }
     try { fs.rmSync(out, { force: true }); } catch { /* ignore */ }
-    throw new Error("ffmpeg 编码失败");
+    fs.renameSync(tmp, out);
+    if (!opts.keepWav) fs.rmSync(srcPath, { force: true });
+    return { from: srcPath, to: out, before, after, reused: false };
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+    throw e;
   }
-  const after = fs.statSync(out).size;
-  if (after <= 1024) {
-    fs.rmSync(out, { force: true });
-    throw new Error(`输出异常（${after} 字节）`);
-  }
-  if (!(await verifyAudio(out))) {
-    fs.rmSync(out, { force: true });
-    throw new Error("输出校验失败（无法解码）");
-  }
-  if (!opts.keepWav) fs.rmSync(srcPath, { force: true });
-  return { from: srcPath, to: out, before, after };
 }
 
 /**
@@ -195,22 +300,39 @@ async function archiveDir(dir, opts = {}, onProgress) {
  * Unlike archiveFile() this makes no .wav assumption and NEVER deletes the
  * source — used for imported files, where the user's original stays where it is
  * and the meeting folder only keeps a small 16 kHz mono copy.
- * Verifies the result before returning; throws otherwise.
+ * Verifies the result before returning; throws otherwise. The source-vs-
+ * output duration check uses the same tolerance as archiveFile
+ * (max(1% of source, 0.5 s)). Output is written atomically via
+ * `<outPath>.tmp` and renamed to the final name only after every check
+ * passes; any failure removes the temp and leaves the final name untouched.
  * @returns {Promise<{out:string, bytes:number, preset:object}>}
  */
 async function transcodeTo(srcPath, outPath, opts = {}) {
   const preset = resolvePreset(opts);
-  fs.mkdirSync(path.dirname(outPath), { recursive: true });
-  const ok = await runFfmpeg(encodeArgs(preset, srcPath, outPath));
-  const fail = (msg) => {
+  const outDir = path.dirname(outPath);
+  if (outDir) fs.mkdirSync(outDir, { recursive: true });
+  const sourceDur = await probeDurationSec(srcPath); // may be null
+  const tmp = outPath + ".tmp";
+  try {
+    const ok = await runFfmpeg(encodeArgs(preset, srcPath, tmp));
+    if (!ok || !fs.existsSync(tmp)) throw new Error("ffmpeg 编码失败");
+    const bytes = fs.statSync(tmp).size;
+    if (bytes <= 1024) throw new Error(`输出异常（${bytes} 字节）`);
+    const outDur = await probeDurationSec(tmp);
+    if (outDur === null) throw new Error("输出校验失败（无法解码）");
+    if (sourceDur !== null && !durationsMatch(sourceDur, outDur)) {
+      throw new Error(
+        `输出校验失败（时长不一致：源 ${sourceDur.toFixed(2)} s，输出 ${outDur.toFixed(2)} s，`
+        + `容忍 ±${durationTolerance(sourceDur).toFixed(2)} s）`
+      );
+    }
     try { fs.rmSync(outPath, { force: true }); } catch { /* ignore */ }
-    throw new Error(msg);
-  };
-  if (!ok || !fs.existsSync(outPath)) fail("ffmpeg 编码失败");
-  const bytes = fs.statSync(outPath).size;
-  if (bytes <= 1024) fail(`输出异常（${bytes} 字节）`);
-  if (!(await verifyAudio(outPath))) fail("输出校验失败（无法解码）");
-  return { out: outPath, bytes, preset };
+    fs.renameSync(tmp, outPath);
+    return { out: outPath, bytes, preset };
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+    throw e;
+  }
 }
 
 function meetingDirs(root) {  try {
@@ -317,4 +439,7 @@ module.exports = {
   archiveAll,
   scan,
   wavInfo,
+  probeDurationSec,
+  durationTolerance,
+  durationsMatch,
 };

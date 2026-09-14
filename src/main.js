@@ -20,7 +20,7 @@ const llmProviders = require("./llmProviders");
 const os = require("os");
 
 let win = null;
-let rec = { system: null, mic: null, levelTimers: [], busy: false };
+let rec = { system: null, mic: null, levelTimers: [], busy: false, limitFired: false, limitReached: null };
 
 /* ---- lifecycle state -----------------------------------------------------
  * `lastActivity` drives the idle auto-quit; `lastLoudAt` drives the
@@ -48,6 +48,7 @@ function lifecycleCfg() {
       silenceMin: typeof a.silenceMin === "number" ? a.silenceMin : 10,
       forceStopAfterMin: typeof a.forceStopAfterMin === "number" ? a.forceStopAfterMin : 5,
       minFreeDiskGB: typeof a.minFreeDiskGB === "number" ? a.minFreeDiskGB : 2,
+      maxElapsedMin: typeof a.maxElapsedMin === "number" ? a.maxElapsedMin : 480,
       levelThreshold: typeof a.levelThreshold === "number" ? a.levelThreshold : 8,
     },
   };
@@ -61,9 +62,21 @@ function touchActivity() {
   lifecycle.idleWarned = false;
 }
 
+/** The volume that actually holds the recordings.
+ *  This used to be the process cwd's volume, which is a different disk whenever
+ *  meetingsDir points elsewhere (e.g. D:) — the guard then watched the wrong
+ *  drive and could not stop a recording that was filling up the real one. */
+function meetingsVolumeRoot() {
+  try {
+    const dir = config.meetingsDir(config.load());
+    if (typeof dir === "string" && dir) return path.parse(dir).root || "C:\\";
+  } catch { /* fall back to cwd below */ }
+  return path.parse(process.cwd()).root || "C:\\";
+}
+
 function freeDiskGB() {
   try {
-    const st = fs.statfsSync(path.parse(process.cwd()).root || "C:\\");
+    const st = fs.statfsSync(meetingsVolumeRoot());
     return (st.bavail * st.bsize) / 1e9;
   } catch {
     return null;
@@ -154,6 +167,7 @@ function startLifecycleWatchdog() {
         diskWarned: lifecycle.diskWarned,
         suppressed: lifecycle.autoStopSuppressed,
         diskFreeGB: recording ? freeDiskGB() : null,
+        recStartMs: recording ? rec.startTime : null,
       },
       lc,
       now
@@ -183,7 +197,20 @@ function startLifecycleWatchdog() {
       } else if (a.type === "warn-idle") {
         notifyUser("Audio2Notes 即将自动退出", `空闲 ${a.threshold} 分钟后自动退出（可在设置里关闭）。现在仍可继续使用。`);
       } else if (a.type === "stop") {
-        send("lifecycle", { type: "auto-stop-request", reason: a.reason, silentSec: a.silentSec });
+        if (a.reason === "max-duration") {
+          // Hard ceiling, enforced directly here (the watchdog already has the
+          // full context — and the user cannot negotiate away a time fuse), and
+          // leaving a non-silent trace on the artifacts
+          rec.stopReason = "max-duration";
+          notifyUser("录音已到达时长上限",
+            `已录音 ${a.elapsedMin} 分钟，达到最大录音时长，正在自动停止并完成处理…`, rec.dir || null);
+          stopRecordingAndProcess().catch((e) => {
+            console.error("[duration] auto-stop failed:", (e && e.message) || e);
+            rec.busy = false;
+          });
+        } else {
+          send("lifecycle", { type: "auto-stop-request", reason: a.reason, silentSec: a.silentSec });
+        }
       } else if (a.type === "quit") {
         lifecycle.forceQuit = true;
         app.quit();
@@ -452,6 +479,19 @@ async function archiveMeeting(dir, cfg) {
   return info;
 }
 
+/**
+ * Pure scan: does this capture --status text contain a file-size "fuse" line?
+ * capture.exe writes `LIMIT bytes=<n> limit=<n>` (both plain decimal integers)
+ * into the status file immediately before the usual FINISHED line when a
+ * recording WAV is about to exceed its byte limit. Returns { bytes, limit } or
+ * null. Kept pure so the detection logic is trivially unit-testable.
+ */
+function scanLimitLine(text) {
+  const m = (text || "").match(/^LIMIT\s+bytes=(\d+)\s+limit=(\d+)/m);
+  if (!m) return null;
+  return { bytes: +m[1], limit: +m[2] };
+}
+
 /* ---- level polling (reads --status files; sandbox-safe) ------------------ */
 function pollLevels() {
   for (const key of ["system", "mic"]) {
@@ -465,6 +505,28 @@ function pollLevels() {
         const last = lines[lines.length - 1];
         const m = last && last.match(/^LEVEL\s+(\d+)/);
         if (m) level = Math.max(0, Math.min(100, +m[1]));
+        // FINISHED is written AFTER the fuse line, so a "last line == LEVEL"
+        // check would miss it — scan the whole file for a LIMIT line instead.
+        // rec.limitFired makes this fire exactly once per recording; it resets
+        // on the next record:start. rec.busy re-entrancy is enforced inside
+        // stopRecordingAndProcess(), so no second stop path can race this one.
+        if (!rec.limitFired) {
+          const lim = scanLimitLine(text);
+          if (lim) {
+            rec.limitFired = true;
+            rec.limitReached = { track: key, bytes: lim.bytes, limit: lim.limit };
+            notifyUser("录音文件已达大小上限",
+              `${r.kind} 轨道录音已到达文件大小上限，正在自动停止并完成转写…`, rec.dir || null);
+            // Fire-and-forget from a timer: stopRecordingAndProcess() sets
+            // rec.busy = true before its own try block, so an early throw would
+            // leak busy=true — and record:start rejects while busy, which would
+            // block every later recording until the app restarts. Catch it here.
+            stopRecordingAndProcess().catch((e) => {
+              console.error("[limit] auto-stop failed:", (e && e.message) || e);
+              rec.busy = false;
+            });
+          }
+        }
       } catch { /* not ready yet */ }
       if (level != null) {
         send("level", { source: r.kind, level });
@@ -624,28 +686,40 @@ ipcMain.handle("record:start", async (_e, opts = {}) => {
     for (const r of Object.values(procs)) capture.stopCapture(r);
     return { error: e.message };
   }
-  rec = { ...rec, ...procs, dir, startTime: Date.now() };
+  rec = { ...rec, ...procs, dir, startTime: Date.now(), limitFired: false, limitReached: null, stopReason: null };
   pollLevels();
   return { ok: true, dir };
 });
 
-ipcMain.handle("record:stop", async () => {
+async function stopRecordingAndProcess() {
   if (!rec.system && !rec.mic) return { error: "not recording" };
+  if (rec.busy) return { error: "already processing" };
   rec.busy = true;
   stopPolling();
   const sources = {};
   let durationSec = 0;
+  /* Signal both tracks at the same instant — a sequential shutdown lets the
+   * second track keep recording for the first track's whole exit (up to the
+   * 4 s kill), which skews the tail and corrupts cross-track alignment. */
   for (const key of ["system", "mic"]) {
     const r = rec[key];
-    if (r) {
-      await capture.stopCapture(r);
-      if (fs.existsSync(r.wavFile) && fs.statSync(r.wavFile).size > 44) sources[key] = r.wavFile;
-      try {
-        const text = fs.readFileSync(r.statusFile, "utf8");
-        const m = text.match(/dur=([\d.]+)/);
-        if (m) durationSec = Math.max(durationSec, parseFloat(m[1]));
-      } catch { /* ignore */ }
-    }
+    if (r) capture.requestStop(r);
+  }
+  for (const key of ["system", "mic"]) {
+    const r = rec[key];
+    if (r) await capture.stopCapture(r);
+  }
+  /* Only after every process has exited are the --status files final, so the
+   * dur= reads happen here. durationSec is still the max across tracks. */
+  for (const key of ["system", "mic"]) {
+    const r = rec[key];
+    if (!r) continue;
+    if (fs.existsSync(r.wavFile) && fs.statSync(r.wavFile).size > 44) sources[key] = r.wavFile;
+    try {
+      const text = fs.readFileSync(r.statusFile, "utf8");
+      const m = text.match(/dur=([\d.]+)/);
+      if (m) durationSec = Math.max(durationSec, parseFloat(m[1]));
+    } catch { /* ignore */ }
   }
   rec.system = null; rec.mic = null;
   const dir = rec.dir;
@@ -660,7 +734,7 @@ ipcMain.handle("record:stop", async () => {
       rec.busy = false;
       touchActivity();
       send("pipeline", { phase: "done", message: "已排队，插电后自动转写", dir });
-      return { ok: true, queued: true, dir, queue: q.queue, archive: q.archive, powerNote: profile.notes };
+      return { ok: true, queued: true, dir, queue: q.queue, archive: q.archive, powerNote: profile.notes, limitReached: rec.limitReached || null, stopReason: rec.stopReason || null };
     } catch (e) {
       rec.busy = false;
       return { error: "排队失败：" + e.message, dir };
@@ -711,6 +785,8 @@ ipcMain.handle("record:stop", async () => {
       translationSkipped: translated ? null : transcript.translationSkipped || null,
       translationEngine: translated ? cfg.translation.engine : null,
       speakerLabels: ["你", "远端"],
+      limitReached: rec.limitReached || null,
+      stopReason: rec.stopReason || null,
     };
     meetings.writeArtifacts(dir, { transcript, notes, meta });
 
@@ -736,6 +812,8 @@ ipcMain.handle("record:stop", async () => {
       notesMapReduce: !!notes.mapReduce,
       notesChunks: notes.chunks || 1,
       archive, archiveError,
+      limitReached: rec.limitReached || null,
+      stopReason: rec.stopReason || null,
     };
   } catch (e) {
     console.error("pipeline error:", e);
@@ -743,7 +821,9 @@ ipcMain.handle("record:stop", async () => {
     rec.busy = false;
     return { error: e.message, dir };
   }
-});
+}
+
+ipcMain.handle("record:stop", async () => stopRecordingAndProcess());
 
 ipcMain.handle("file:transcribe", async (_e, filePath) => {
   if (rec.busy) return { error: "busy" };
@@ -1352,7 +1432,7 @@ function startPowerWatchers() {
  * capture.exe sessions tells us which processes are playing audio; the rules
  * live in src/meetingDetect.js. Starting a recording by itself is opt-in
  * (privacy); noticing that the call ended is on by default. */
-let meetingState = { activeSince: null, inactiveSince: null };
+let meetingState = { activeSince: null, inactiveSince: null, sawWatchedApp: false };
 let lastSessions = [];
 
 function meetingRule() {
@@ -1534,6 +1614,7 @@ ipcMain.handle("lifecycle:status", () => {
     autoQuitAfterMin: lc.autoQuitAfterMin,
     autoStop: lc.autoStop,
     freeDiskGB: freeDiskGB(),
+    diskRoot: meetingsVolumeRoot(),
     forceQuitArmed: lifecycle.forceQuit,
   };
 });

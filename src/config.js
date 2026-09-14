@@ -52,6 +52,7 @@ const DEFAULTS = {
       silenceMin: 10,         // minutes without speech before warning
       forceStopAfterMin: 5,   // minutes after the warning before stopping anyway
       minFreeDiskGB: 2,       // stop recording when free space drops below this
+      maxElapsedMin: 480,     // stop once a recording has run this long (0 = no time limit)
       levelThreshold: 8,      // LEVEL (0-100) counted as "speech" by capture.exe
     },
     meetingDetect: {

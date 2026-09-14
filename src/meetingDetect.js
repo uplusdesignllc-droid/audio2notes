@@ -11,6 +11,11 @@
  * Defaults are deliberately asymmetric:
  *   autoStop  = on   — the recording was started by a human; noticing the call
  *                      ended simply avoids recording silence for hours.
+ *                      Precondition: auto-stop only applies if a watched app was
+ *                      actually seen (state=Active) during this recording. A
+ *                      recording that never heard one (in-person meeting, browser
+ *                      call, voice memo) is never stopped by this rule; the
+ *                      silence watchdog covers its "nobody spoke" case.
  *   autoStart = off  — starting to record a meeting by itself is a privacy
  *                      decision, so it must be switched on explicitly. */
 
@@ -44,17 +49,18 @@ function activeMeetingApp(sessions, rule) {
  * @returns {{actions:Array<{type:string,app?:string}>, next:Object, activeApp:string|null}}
  */
 function evaluate(state, input) {
-  const s = Object.assign({ activeSince: null, inactiveSince: null }, state || {});
+  const s = Object.assign({ activeSince: null, inactiveSince: null, sawWatchedApp: false }, state || {});
   const rule = normalizeRule(input.rule);
   const now = input.now;
   const actions = [];
   const activeApp = activeMeetingApp(input.sessions, rule);
   const next = Object.assign({}, s);
 
-  if (!rule.enabled) return { actions, next: { activeSince: null, inactiveSince: null }, activeApp };
+  if (!rule.enabled) return { actions, next: { activeSince: null, inactiveSince: null, sawWatchedApp: false }, activeApp };
 
   if (activeApp) {
     next.inactiveSince = null;
+    next.sawWatchedApp = input.recording; // latch: set only while a watched app is seen AND recording; cleared when not recording
     if (s.activeSince == null) {
       next.activeSince = now;
     } else if (
@@ -70,12 +76,13 @@ function evaluate(state, input) {
     if (input.recording) {
       if (s.inactiveSince == null) {
         next.inactiveSince = now;
-      } else if (rule.autoStop && now - s.inactiveSince >= rule.stopAfterSec * 1000) {
+      } else if (rule.autoStop && s.sawWatchedApp && now - s.inactiveSince >= rule.stopAfterSec * 1000) {
         actions.push({ type: "stop", reason: "meeting-app-quiet" });
         next.inactiveSince = now;
       }
     } else {
       next.inactiveSince = null;
+      next.sawWatchedApp = false; // self-closing latch: a new recording starts clean
     }
   }
 

@@ -54,11 +54,24 @@ function startCapture(kind, wavFile, statusFile) {
   return { child, statusFile, stopFile, wavFile, kind };
 }
 
+/**
+ * Signal a started capture to finalize: ONLY writes the stop file, never waits.
+ * requestStop() on every track first, then stopCapture() on each (see
+ * main.js's stopRecordingAndProcess) is what keeps the two track tails aligned.
+ * Idempotent: writing the file again is harmless, and it never throws, even
+ * when rec is not a live capture.
+ */
+function requestStop(rec) {
+  if (!rec || typeof rec.stopFile !== "string") return;
+  try { fs.writeFileSync(rec.stopFile, "stop"); } catch { /* ignore */ }
+}
+
 function stopCapture(rec) {
   return new Promise((resolve) => {
     if (!rec || !rec.child || rec.child.killed || rec.child.exitCode !== null) return resolve(0);
-    // graceful: touch the stop file, wait for capture.exe to finalize the wav
-    try { fs.writeFileSync(rec.stopFile, "stop"); } catch { /* ignore */ }
+    // graceful: touch the stop file (idempotent via requestStop), then wait
+    // for capture.exe to finalize the wav
+    requestStop(rec);
     const timer = setTimeout(() => {
       try { rec.child.kill(); } catch { /* ignore */ }
     }, 4000);
@@ -92,4 +105,4 @@ async function listSessions() {
   return sessions;
 }
 
-module.exports = { exePath, listDevices, listSessions, startCapture, stopCapture };
+module.exports = { exePath, listDevices, listSessions, startCapture, requestStop, stopCapture };
