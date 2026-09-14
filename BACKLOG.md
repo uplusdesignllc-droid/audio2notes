@@ -405,6 +405,40 @@ And the log line `load_tensors: offloaded N/M layers to GPU` is the authoritativ
 - **P5-3 note:** `@xenova/transformers` 2.x is superseded by `@huggingface/transformers`. That is
   a migration with its own verification burden, not an audit fix — keep it out of P5-1/P5-2.
 
+### P6 — participant naming (NEW REQUEST 2026-09-14; a feature, not a bug)
+The owner went looking for "a menu to type in the meeting participants" and could not find one.
+It does not exist. What DOES exist is post-hoc per-speaker renaming, in the meeting detail view:
+
+- `renderer/app.js:961-1124` — one row per diarized speaker with a name field, a **5 s audition**
+  (`speakersAudition`), **merge two speakers** (`speakersMerge`) and **re-diarize**
+  (`speakersDiarize`). Rows only appear once that meeting has speakers, i.e. after diarization.
+- `speakersSetName({dir, speakerId, name})` renames by **stable id** and refreshes the notes
+  (`src/main.js:~1034`); the transcript view also renames by clicking a speaker badge
+  (`renderer/app.js:1161-1167`).
+- `meta.speakerLabels` records the names (`src/main.js:1057`, `:1094`).
+
+Why the owner saw nothing: the block lives in the meeting detail view and needs a meeting whose
+diarization has already run — the meeting recorded immediately before this request was still
+mid-pipeline, so there was nothing to show.
+
+What is missing is an explicit participant list. Diarization only clusters voices; it cannot
+produce names, so the notes carry 「你 / 远端」 or `spk1…spkN` until each one is renamed by hand.
+Three options, cheapest first:
+
+1. **A participant list the user types** (before or after recording), stored in `meta.json`, used
+   to populate the naming rows directly instead of renaming speakers one at a time.
+2. **Feed those names to Whisper as `initial_prompt`** ⭐ — Whisper biases toward prompt text, so a
+   participant list should improve the spelling of names and company names. Highest value for the
+   lowest cost: it targets exactly the words the 24 kbps measurement showed being mangled
+   (`bristol → crystal`, `restalwest → restylwest`, see P3-2), and it improves ASR quality for
+   every meeting rather than only the labelling UI.
+3. **A cross-meeting voice-print library** so a known person is suggested automatically. The
+   natural extension of `diarize.js`, and by far the largest piece — its own phase.
+
+Separate, small bug found while looking: **`speaker-rows` appears twice as an id** in
+`renderer/index.html` (lines 93 and 167). Duplicate ids are invalid HTML and `$("speaker-rows")`
+silently returns only the first; one of the two needs a different id.
+
 ## 3. Investigated and rejected (with the real reasons)
 - **Recording straight to Ogg/Opus** — loses "a hard kill still yields a decodable file" and
   makes `capture.exe` depend on libopus. The only genuine route would be encoding inside
