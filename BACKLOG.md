@@ -460,11 +460,26 @@ is real:
 Recommendation: **(a) with the skip option**, because it is the only variant that pays for itself
 in transcript quality; fall back to (b)/(c) if it turns out to nag.
 
-⚠ **Verify before designing around (a):** whether `@xenova/transformers` 2.x actually accepts a
-prompt / `initial_prompt` for Whisper generation. `transcribe.js:~291` currently passes only
-`chunk_length_s`, `stride_length_s`, `return_timestamps` and `callback_function`. Whisper itself
-supports an initial prompt, but this binding's support is unverified — do not promise an ASR
-benefit until it is checked.
+⚠ **Checked 2026-09-14 — option 2 is NOT available out of the box, which changes how much
+variant (a) is worth.** `@xenova/transformers` 2.17.2 has **no `initial_prompt` support at all**
+(no matches anywhere in the package). Its ASR pipeline builds `forced_decoder_ids` itself from
+language/task/timestamps only (`src/pipelines.js:1748-1750`) and takes no user prompt. The model
+layer does accept `decoder_input_ids` via the generation config (`src/models.js:407-418`), so
+prompting is reachable — but only by hand-framing Whisper's decoder prefix
+(`<|startoftranscript|>`, language, task, prompt tokens, `<|notimestamps|>`) and passing it
+through, which nothing here has verified. Treat "feed the participant names to Whisper" as a
+research sub-task, not a parameter.
+
+**Cheaper alternative that targets the same words:** post-correct the transcript against the
+participant list — a fuzzy/phonetic match of transcript tokens to the supplied names, above a high
+similarity threshold. It needs no model work at all, it fixes exactly the mangled-name failures
+(`bristol → crystal`, `restalwest → restylwest`), and it composes with the naming UI. Its risk is
+the opposite one: an over-eager corrector invents names that were never said, so it must be
+conservative and should say what it changed.
+
+Net effect on the trigger question: variant (a) still gives the user the names earlier and lets
+the naming rows be prefilled, but its ASR payoff is no longer free, so (a) versus (b)/(c) is now
+mostly about *when the user is asked* rather than about transcript quality.
 
 **Observability gap noticed during the 2026-09-14 acceptance run:** `meta.stopReason` is only ever
 set to `"max-duration"`. The meeting that ending via the meeting-app-quiet rule recorded nothing,
