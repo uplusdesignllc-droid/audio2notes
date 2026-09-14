@@ -208,9 +208,12 @@ static void describe(const WAVEFORMATEX* f, FmtInfo* out) {
 }
 
 static void write_wav_header(FILE* f, const FmtInfo* fi) {
-  DWORD data_size = 0;
+  long long data_size = 0; /* 64-bit accumulator; the initial header is provably 0 */
+  long long riff = 36 + data_size; /* 64-bit arithmetic */
+  DWORD total = (riff <= 0xFFFFFFFFLL) ? (DWORD) riff : (DWORD)-1;
+  DWORD ds = (data_size <= 0xFFFFFFFFLL) ? (DWORD) data_size : (DWORD)-1;
   fwrite("RIFF", 1, 4, f);
-  fwrite(&(DWORD){36 + data_size}, 4, 1, f);
+  fwrite(&total, 4, 1, f);
   fwrite("WAVE", 1, 4, f);
   fwrite("fmt ", 1, 4, f);
   fwrite(&(DWORD){16}, 4, 1, f);
@@ -221,16 +224,17 @@ static void write_wav_header(FILE* f, const FmtInfo* fi) {
   fwrite(&(WORD){fi->channels * 2}, 2, 1, f);
   fwrite(&(WORD){16}, 2, 1, f);
   fwrite("data", 1, 4, f);
-  fwrite(&data_size, 4, 1, f);
+  fwrite(&ds, 4, 1, f);
 }
 
 static void finalize_wav(FILE* f, long long data_bytes) {
   fflush(f);
+  long long riff = 36 + data_bytes; /* 64-bit arithmetic; limit guard keeps it in DWORD range */
+  DWORD total = (riff <= 0xFFFFFFFFLL) ? (DWORD) riff : (DWORD)-1;
   fseek(f, 4, SEEK_SET);
-  DWORD total = (DWORD)(36 + data_bytes);
   fwrite(&total, 4, 1, f);
   fseek(f, 40, SEEK_SET);
-  DWORD ds = (DWORD)data_bytes;
+  DWORD ds = (data_bytes <= 0xFFFFFFFFLL) ? (DWORD) data_bytes : (DWORD)-1;
   fwrite(&ds, 4, 1, f);
   fclose(f);
 }
@@ -262,7 +266,7 @@ static int convert_to_s16(const BYTE* src, size_t frames, const FmtInfo* fi, sho
   return 1;
 }
 
-static int cmd_record(const char* kind, const char* path, double seconds) {
+static int cmd_record(const char* kind, const char* path, double seconds, long long limit_bytes, double header_refresh_sec) {
   EDataFlow flow = (strcmp(kind, "system") == 0) ? eRender : eCapture;
   DWORD flags = (flow == eRender) ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0;
 
@@ -290,12 +294,37 @@ static int cmd_record(const char* kind, const char* path, double seconds) {
   FmtInfo fi;
   describe(fmt, &fi);
   if (fi.channels == 0 || fi.rate == 0) fail("unsupported format", E_FAIL);
-  emit("READY fmt=%lu:%u:%u\n", (unsigned long)fi.rate, (unsigned)fi.channels, (unsigned)fi.bits);
 
+  FmtInfo rec_fi; /* the format the client will ACTUALLY deliver (requested one, or the mix format on fallback) */
   REFERENCE_TIME hns = 2000000; /* 200 ms */
-  hr = client->lpVtbl->Initialize(client, AUDCLNT_SHAREMODE_SHARED, flags, hns, hns, fmt, NULL);
+
+  /* TASK 1: ask WASAPI (shared mode) to resample/convert to 16 kHz mono 16-bit PCM. */
+  WAVEFORMATEX want;
+  memset(&want, 0, sizeof(want));
+  want.wFormatTag = WAVE_FORMAT_PCM;
+  want.nChannels = 1;
+  want.nSamplesPerSec = 16000;
+  want.wBitsPerSample = 16;
+  want.nBlockAlign = (WORD)(want.nChannels * (want.wBitsPerSample / 8)); /* 2 */
+  want.nAvgBytesPerSec = (DWORD)(want.nSamplesPerSec * want.nBlockAlign); /* 32000 */
+  want.cbSize = 0;
+
+  DWORD req_flags = flags | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+  HRESULT ihr = client->lpVtbl->Initialize(client, AUDCLNT_SHAREMODE_SHARED, req_flags, hns, hns, &want, NULL);
+  if (SUCCEEDED(ihr)) {
+    rec_fi.rate = want.nSamplesPerSec;
+    rec_fi.channels = want.nChannels;
+    rec_fi.bits = want.wBitsPerSample;
+    rec_fi.is_float = 0;
+  } else {
+    /* Fallback: exactly today's behaviour — deliver the mix format with the original flags. */
+    hr = client->lpVtbl->Initialize(client, AUDCLNT_SHAREMODE_SHARED, flags, hns, hns, fmt, NULL);
+    if (FAILED(hr)) { CoTaskMemFree(fmt); fail("Initialize (shared)", hr); }
+    rec_fi = fi;
+  }
   CoTaskMemFree(fmt);
-  if (FAILED(hr)) fail("Initialize (shared)", hr);
+
+  emit("READY fmt=%lu:%u:%u\n", (unsigned long)rec_fi.rate, (unsigned)rec_fi.channels, (unsigned)rec_fi.bits);
 
   IAudioCaptureClient* cap = NULL;
   hr = client->lpVtbl->GetService(client, &IID_IAudioCaptureClient, (void**)&cap);
@@ -303,18 +332,35 @@ static int cmd_record(const char* kind, const char* path, double seconds) {
 
   FILE* f = fopen(path, "wb");
   if (!f) { fprintf(stderr, "ERR cannot open %s\n", path); return 1; }
-  write_wav_header(f, &fi);
+  /* Large user-space stdio buffer: the periodic header refreshes and the 4096-byte
+   * silence-padding chunks coalesce into far fewer, larger writes. Only changes HOW
+   * bytes are buffered, never WHAT is written. */
+  setvbuf(f, NULL, _IOFBF, 1 << 20);
+  write_wav_header(f, &rec_fi);
 
   LARGE_INTEGER freq, t0;
   QueryPerformanceFrequency(&freq);
   QueryPerformanceCounter(&t0);
+  /* Wall-clock anchor for the same instant t0: FILETIME is 100-ns ticks since 1601-01-01;
+   * 10^4 ticks = 1 ms, and the epoch offset 11644473600000 ms = 1601-01-01 .. 1970-01-01. */
+  FILETIME t0_ft;
+  GetSystemTimePreciseAsFileTime(&t0_ft);
+  unsigned __int64 t0_100ns = ((unsigned __int64)t0_ft.dwHighDateTime << 32) | (unsigned __int64)t0_ft.dwLowDateTime;
+  long long unixms = (long long)(t0_100ns / 10000) - 11644473600000LL;
   long long written = 0;
+  long long written_frames = 0; /* sample frames (time-floats) actually on the file, incl. padding */
+  int limited = 0; /* set only when the byte limit was the actual stop reason */
   double peak = 0, last_level = 0;
-  DWORD frames_per_level = (DWORD)(fi.rate / 2); /* ~0.5 s */
+  DWORD frames_per_level = (DWORD)(rec_fi.rate / 2); /* ~0.5 s */
 
   SetConsoleCtrlHandler(on_ctrl, TRUE);
   hr = client->lpVtbl->Start(client);
   if (FAILED(hr)) fail("Start", hr);
+
+  /* Wall-clock start anchor, emitted once after Start. QueryPerformanceCounter is
+   * system-wide on Windows, so a consumer can subtract two tracks' qpc/freq values
+   * to recover the exact start offset between separately-spawned capture processes. */
+  emit("T0 qpc=%lld freq=%lld unixms=%lld\n", (long long)t0.QuadPart, (long long)freq.QuadPart, unixms);
 
   DWORD frames_in_level = 0;
   LARGE_INTEGER last_patch; QueryPerformanceCounter(&last_patch);
@@ -329,15 +375,22 @@ static int cmd_record(const char* kind, const char* path, double seconds) {
       hr = cap->lpVtbl->GetBuffer(cap, &data, &frames, &pflags, &dpos, &qpos);
       if (FAILED(hr)) { fprintf(stderr, "ERR GetBuffer (0x%08lx)\n", (unsigned long)hr); break; }
       if (frames > 0) {
-        short* tmp = (short*)malloc((size_t)frames * fi.channels * 2);
-        if (tmp && convert_to_s16(data, frames, &fi, tmp)) {
-          fwrite(tmp, 2, (size_t)frames * fi.channels, f);
-          written += (long long)frames * fi.channels * 2;
-        }
-        if (fi.is_float) {
-          const float* p = (const float*)data;
-          size_t n = (size_t)frames * fi.channels;
-          for (size_t i = 0; i < n; i++) { float a = p[i] < 0 ? -p[i] : p[i]; if (a > peak) peak = a; }
+        long long pkt = (long long)frames * rec_fi.channels * 2; /* 64-bit packet size */
+        short* tmp = (short*)malloc((size_t)frames * rec_fi.channels * 2);
+        if (tmp && convert_to_s16(data, frames, &rec_fi, tmp)) {
+          /* TASK 2: level from the converted s16 buffer — valid for PCM AND float sources alike */
+          for (size_t i = 0; i < (size_t)frames * rec_fi.channels; i++) {
+            int a = tmp[i] < 0 ? -tmp[i] : tmp[i];
+            double na = (double)a / 32768.0;
+            if (na > peak) peak = na;
+          }
+          if (written + pkt <= limit_bytes) {
+            fwrite(tmp, 2, (size_t)frames * rec_fi.channels, f);
+            written += pkt;
+            written_frames += frames; /* keep the timeline frame count honest */
+          } else {
+            limited = 1; /* drop this packet; break out as a graceful stop */
+          }
         }
         free(tmp);
       }
@@ -353,21 +406,62 @@ static int cmd_record(const char* kind, const char* path, double seconds) {
         peak = 0;
       }
     }
+    if (limited) break;
+
+    /* TASK 3: silence padding — WASAPI loopback delivers NO packets while the endpoint has no
+     * active render stream, and that wall-clock time must still land in the file so this track's
+     * timeline stays aligned with the mic track. Base on (elapsed - frames already written) so
+     * padding never drifts; cap at the requested --seconds; padded bytes still count toward the fuse. */
+    {
+      LARGE_INTEGER nowp; QueryPerformanceCounter(&nowp);
+      double elapsed = (double)(nowp.QuadPart - t0.QuadPart) / freq.QuadPart;
+      long long target_frames = (long long)(elapsed * (double)rec_fi.rate);
+      if (target_frames > written_frames) {
+        long long pad = target_frames - written_frames;
+        if (seconds > 0) {
+          long long max_frames = (long long)(seconds * (double)rec_fi.rate);
+          if (written_frames + pad > max_frames) pad = max_frames - written_frames;
+        }
+        if (pad > 0) {
+          long long pad_bytes = pad * (long long)rec_fi.channels * 2;
+          if (written + pad_bytes <= limit_bytes) {
+            unsigned char zbuf[4096];
+            memset(zbuf, 0, sizeof zbuf);
+            long long remaining = pad_bytes;
+            while (remaining > 0) {
+              size_t c = remaining > (long long)sizeof zbuf ? sizeof zbuf : (size_t)remaining;
+              fwrite(zbuf, 1, c, f);
+              remaining -= c;
+            }
+            written += pad_bytes;
+            written_frames += pad;
+          } else {
+            limited = 1; /* the fuse tripped while padding */
+          }
+        }
+      }
+    }
+
     if (seconds > 0) {
       LARGE_INTEGER now; QueryPerformanceCounter(&now);
       if ((double)(now.QuadPart - t0.QuadPart) / freq.QuadPart >= seconds) break;
     }
-    /* keep the RIFF header sizes fresh so a hard kill still yields a valid wav */
+    /* keep the RIFF header sizes fresh so a hard kill still yields a valid wav.
+     * The fflush BEFORE the size patch is what forces the buffered data out — a
+     * kill between the patch and the next flush would leave a stale header. A
+     * longer refresh interval trades a larger crash window for fewer writes,
+     * which is why the default stays at 2 s. */
     {
       LARGE_INTEGER now; QueryPerformanceCounter(&now);
-      if ((double)(now.QuadPart - last_patch.QuadPart) / freq.QuadPart >= 2.0) {
+      if ((double)(now.QuadPart - last_patch.QuadPart) / freq.QuadPart >= header_refresh_sec) {
         last_patch = now;
         fflush(f);
+        long long riff = 36 + written; /* 64-bit arithmetic; limit guard keeps it in DWORD range */
+        DWORD total = (riff <= 0xFFFFFFFFLL) ? (DWORD) riff : (DWORD)-1;
         fseek(f, 4, SEEK_SET);
-        DWORD total = (DWORD)(36 + written);
         fwrite(&total, 4, 1, f);
         fseek(f, 40, SEEK_SET);
-        DWORD ds = (DWORD)written;
+        DWORD ds = (written <= 0xFFFFFFFFLL) ? (DWORD) written : (DWORD)-1;
         fwrite(&ds, 4, 1, f);
         fseek(f, 0, SEEK_END);
       }
@@ -380,6 +474,7 @@ static int cmd_record(const char* kind, const char* path, double seconds) {
   LARGE_INTEGER now; QueryPerformanceCounter(&now);
   double dur = (double)(now.QuadPart - t0.QuadPart) / freq.QuadPart;
   finalize_wav(f, written);
+  if (limited) emit("LIMIT bytes=%lld limit=%lld\n", written, limit_bytes);
   emit("FINISHED bytes=%lld dur=%.2f\n", written, dur);
   cap->lpVtbl->Release(cap);
   client->lpVtbl->Release(client);
@@ -407,15 +502,28 @@ int main(int argc, char** argv) {
   }
   if (argc >= 4 && strcmp(argv[1], "record") == 0) {
     double seconds = 0;
+    long long limit_bytes = 3758096384LL; /* 3.5 GiB default fuse */
+    double header_refresh_sec = 2.0; /* header refresh interval; default unchanged */
     for (int i = 4; i < argc; i++) {
       if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) seconds = atof(argv[i + 1]);
+      else if (strcmp(argv[i], "--limit-bytes") == 0 && i + 1 < argc) limit_bytes = atoll(argv[i + 1]);
+      else if (strcmp(argv[i], "--header-refresh-sec") == 0 && i + 1 < argc) header_refresh_sec = atof(argv[i + 1]);
       else if (strcmp(argv[i], "--status") == 0 && i + 1 < argc) g_status = fopen(argv[i + 1], "wb");
       else if (strcmp(argv[i], "--stop") == 0 && i + 1 < argc) g_stop_file = argv[i + 1];
     }
-    int rc = cmd_record(argv[2], argv[3], seconds);
+    if (limit_bytes <= 0) limit_bytes = 3758096384LL;
+    /* Invalid/unset (<=0) falls back to the 2 s default; otherwise clamp to [0.5, 60]. */
+    if (header_refresh_sec <= 0.0) header_refresh_sec = 2.0;
+    if (header_refresh_sec < 0.5) header_refresh_sec = 0.5;
+    if (header_refresh_sec > 60.0) header_refresh_sec = 60.0;
+    /* A WAV header is 32-bit. If the limit were allowed above the RIFF ceiling the three
+     * narrowing sites would silently clamp to 0xFFFFFFFF and the file would decode short —
+     * the exact silent corruption this fuse exists to prevent. Cap it instead. */
+    if (limit_bytes > 4294967259LL) limit_bytes = 4294967259LL; /* 0xFFFFFFFF - 36 */
+    int rc = cmd_record(argv[2], argv[3], seconds, limit_bytes, header_refresh_sec);
     if (g_status) fclose(g_status);
     return rc;
   }
-  fprintf(stderr, "ERR usage: capture.exe list [-o file] | sessions [-o file] | record <system|mic> <out.wav> [--seconds N] [--status file]\n");
+  fprintf(stderr, "ERR usage: capture.exe list [-o file] | sessions [-o file] | record <system|mic> <out.wav> [--seconds N] [--limit-bytes N] [--header-refresh-sec N] [--status file]\n");
   return 1;
 }
