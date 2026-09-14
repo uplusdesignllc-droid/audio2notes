@@ -375,6 +375,9 @@ async function processQueuedDir(job) {
       translationEngine: translated ? cfg.translation.engine : null,
       powerMode: profile.effective,
       engine: profile.engine.id,
+      // the same provenance the live pipeline records: capture.exe's READY format
+      // and T0 anchor per track, carried through the queue instead of dropped
+      capture: job.captureInfo || null,
     },
   });
   let archive = null;
@@ -425,7 +428,7 @@ async function runQueue(reason) {
 }
 
 /** Park a finished recording instead of transcribing it now (defer mode). */
-async function enqueueMeeting(dir, sources, durationSec, cfg) {
+async function enqueueMeeting(dir, sources, durationSec, cfg, captureInfo) {
   let archive = null;
   try { archive = await archiveMeeting(dir, cfg); } catch (e) { console.error("archive failed:", e); }
   // keep the audio we will need later; the wavs are gone after archiving
@@ -434,6 +437,7 @@ async function enqueueMeeting(dir, sources, durationSec, cfg) {
     reason: "defer",
     sources: Object.keys(sources || {}),
     durationSec,
+    captureInfo: captureInfo || null,
   });
   writeQueue(q);
   send("queue", { type: "added", queue: q.jobs });
@@ -459,16 +463,21 @@ async function archiveMeeting(dir, cfg) {
       progress: Math.round((p.index / p.total) * 100),
     });
   });
+  const fmt = audioArchive.outputFormat(preset);
   const info = {
+    presetId: preset.id,
     codec: preset.codec,
     bitrateKbps: preset.bitrateKbps,
-    sampleRate: preset.codec === "libopus" ? 16000 : preset.sampleRate || 24000,
-    channels: 1,
+    sampleRate: fmt.sampleRate,
+    channels: fmt.channels,
     keepWav: !!opts.keepWav,
     files: r.files,
     savedBytes: r.savedBytes,
     errors: r.errors,
     archivedAt: new Date().toISOString(),
+    // provenance: which encoder build produced the output (null when the
+    // probe cannot run)
+    ffmpeg: await audioArchive.ffmpegVersion(),
   };
   try {
     const metaPath = path.join(dir, "meta.json");
@@ -686,10 +695,27 @@ ipcMain.handle("record:start", async (_e, opts = {}) => {
     for (const r of Object.values(procs)) capture.stopCapture(r);
     return { error: e.message };
   }
-  rec = { ...rec, ...procs, dir, startTime: Date.now(), limitFired: false, limitReached: null, stopReason: null };
+  rec = { ...rec, ...procs, dir, startTime: Date.now(), limitFired: false, limitReached: null, stopReason: null, captureInfo: null };
   pollLevels();
   return { ok: true, dir };
 });
+
+/**
+ * Parse the capture process's `--status` text into provenance metadata:
+ * the format triple from `READY fmt=<rate>:<ch>:<bits>` and the
+ * `T0 qpc=<n> freq=<n> unixms=<n>` reference timestamp. Missing pieces are
+ * null, never invented. NOTE: qpc/freq/unixms are kept as STRINGS — they can
+ * be large integers, and strings guarantee no float rounding in JSON.
+ */
+function parseCaptureStatus(text) {
+  const info = { format: null, t0: null };
+  if (typeof text !== "string") return info;
+  const rm = text.match(/READY fmt=(\d+):(\d+):(\d+)/);
+  if (rm) info.format = `${rm[1]}:${rm[2]}:${rm[3]}`;
+  const tm = text.match(/T0 qpc=(\d+) freq=(\d+) unixms=(\d+)/);
+  if (tm) info.t0 = { qpc: tm[1], freq: tm[2], unixms: tm[3] };
+  return info;
+}
 
 async function stopRecordingAndProcess() {
   if (!rec.system && !rec.mic) return { error: "not recording" };
@@ -711,6 +737,7 @@ async function stopRecordingAndProcess() {
   }
   /* Only after every process has exited are the --status files final, so the
    * dur= reads happen here. durationSec is still the max across tracks. */
+  const captureInfo = {};
   for (const key of ["system", "mic"]) {
     const r = rec[key];
     if (!r) continue;
@@ -719,8 +746,12 @@ async function stopRecordingAndProcess() {
       const text = fs.readFileSync(r.statusFile, "utf8");
       const m = text.match(/dur=([\d.]+)/);
       if (m) durationSec = Math.max(durationSec, parseFloat(m[1]));
+      captureInfo[key] = parseCaptureStatus(text);
     } catch { /* ignore */ }
   }
+  /* Stash the per-track capture provenance on `rec` — the process handles are
+   * cleared just below, but `rec.captureInfo` survives for the meta object. */
+  rec.captureInfo = captureInfo;
   rec.system = null; rec.mic = null;
   const dir = rec.dir;
 
@@ -729,7 +760,7 @@ async function stopRecordingAndProcess() {
   const profile = await currentProfile().catch(() => null);
   if (profile && !profile.runNow) {
     try {
-      const q = await enqueueMeeting(dir, sources, durationSec, config.load());
+      const q = await enqueueMeeting(dir, sources, durationSec, config.load(), rec.captureInfo || null);
       notifyUser("已排队（续航优先模式）", `${path.basename(dir)} —— 插电后自动转写`, dir);
       rec.busy = false;
       touchActivity();
@@ -785,6 +816,7 @@ async function stopRecordingAndProcess() {
       translationSkipped: translated ? null : transcript.translationSkipped || null,
       translationEngine: translated ? cfg.translation.engine : null,
       speakerLabels: ["你", "远端"],
+      capture: rec.captureInfo || null,
       limitReached: rec.limitReached || null,
       stopReason: rec.stopReason || null,
     };

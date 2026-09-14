@@ -48,7 +48,7 @@ async function loadArchivePresets() {
   }
   if (!list.length) {
     console.error("archivePresets returned nothing — falling back to the built-in default");
-    list = [{ id: "opus-24", label: "Opus 24 kbps 单声道（推荐）", codec: "libopus", bitrateKbps: 24, bytesPerHour: 10800000 }];
+    list = [{ id: "opus-32", label: "Opus 32 kbps 单声道（推荐）", codec: "libopus", bitrateKbps: 32, bytesPerHour: 14400000 }];
   }
   ARCHIVE_PRESETS = list;
   archiveSel.innerHTML = "";
@@ -61,11 +61,11 @@ async function loadArchivePresets() {
 }
 
 function selectedPreset() {
-  return ARCHIVE_PRESETS.find((p) => p.id === archiveSel.value) || ARCHIVE_PRESETS[0] || { codec: "libopus", bitrateKbps: 24 };
+  return ARCHIVE_PRESETS.find((p) => p.id === archiveSel.value) || ARCHIVE_PRESETS[0] || { codec: "libopus", bitrateKbps: 32 };
 }
 function presetIdFor(a) {
   const hit = ARCHIVE_PRESETS.find(
-    (p) => p.codec === (a.codec || "libopus") && p.bitrateKbps === Number(a.bitrateKbps || 24)
+    (p) => p.codec === (a.codec || "libopus") && p.bitrateKbps === Number(a.bitrateKbps || 32)
   );
   if (hit) return hit.id;
   return archiveSel.options.length ? archiveSel.options[0].value : "";

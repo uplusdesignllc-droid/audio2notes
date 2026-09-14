@@ -39,7 +39,7 @@ const DEFAULTS = {
     archive: {
       enabled: true,          // compress meeting wavs after the pipeline finishes
       codec: "libopus",       // libopus | libmp3lame
-      bitrateKbps: 24,        // Opus 24 kbps mono ≈ 10.8 MB/hour
+      bitrateKbps: 32,        // Opus 32 kbps mono ≈ 14.4 MB/hour (measured; BACKLOG.md P3-2)
       keepWav: false,         // true = compress but keep the original wav
     },
   },

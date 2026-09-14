@@ -1,9 +1,13 @@
 "use strict";
 /* Audio archiving: replace bulky meeting WAVs with compressed 16 kHz mono audio.
  *
- * 16 kHz mono is exactly Whisper's input format (see transcribe.js:29-37), so
- * re-transcribing an archived meeting loses nothing. Default = Opus 24 kbps
- * mono (~10.8 MB/hour vs ~691 MB/hour for a 48 kHz stereo capture WAV).
+ * 16 kHz mono is exactly Whisper's input format (see transcribe.js:29-37), so the
+ * sample rate and channel count cost nothing — but the codec is lossy and that is
+ * NOT free. MEASURED (120 s of real speech, whisper-base.en, the project default;
+ * method and full table in BACKLOG.md P3-2): 16 kbps and 24 kbps each dropped a
+ * contiguous ~20-word sentence and mangled proper nouns (24 kbps = 8.1% word error
+ * rate), whereas 32 kbps decoded at 1.45% with the names intact. Default = Opus
+ * 32 kbps mono (~14.4 MB/hour vs ~691 MB/hour for a 48 kHz stereo capture WAV).
  *
  * Safety rule: an original WAV is ONLY deleted after its replacement passed
  * four checks — ffmpeg exit 0, output non-trivial (>1 KB), a second
@@ -16,14 +20,15 @@
 
 const { spawn } = require("child_process");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 
 const ffmpegPath = require("./ffmpegPath").ffmpegPath();
 
 const PRESETS = [
-  { id: "opus-16", label: "Opus 16 kbps 单声道（最小）", codec: "libopus", bitrateKbps: 16, ext: "opus" },
-  { id: "opus-24", label: "Opus 24 kbps 单声道（推荐）", codec: "libopus", bitrateKbps: 24, ext: "opus" },
-  { id: "opus-32", label: "Opus 32 kbps 单声道（更好听）", codec: "libopus", bitrateKbps: 32, ext: "opus" },
+  { id: "opus-16", label: "Opus 16 kbps 单声道（最小；实测会丢句）", codec: "libopus", bitrateKbps: 16, ext: "opus" },
+  { id: "opus-24", label: "Opus 24 kbps 单声道（省空间；实测会丢句、改人名）", codec: "libopus", bitrateKbps: 24, ext: "opus" },
+  { id: "opus-32", label: "Opus 32 kbps 单声道（推荐）", codec: "libopus", bitrateKbps: 32, ext: "opus" },
   { id: "opus-48", label: "Opus 48 kbps 单声道", codec: "libopus", bitrateKbps: 48, ext: "opus" },
   {
     id: "mp3-96",
@@ -35,12 +40,14 @@ const PRESETS = [
   },
 ];
 
-const DEFAULT_PRESET_ID = "opus-24";
+const DEFAULT_PRESET_ID = "opus-32";
 
 /** Preset for a settings object; never throws. */
 function resolvePreset(opts = {}) {
   const codec = (opts && opts.codec) || "libopus";
-  const kbps = Number((opts && opts.bitrateKbps) || 24) || 24;
+  /* NOTE: this literal — not DEFAULT_PRESET_ID — is what an empty opts resolves to,
+   * because the exact-match lookup below hits it first. Keep the two in step. */
+  const kbps = Number((opts && opts.bitrateKbps) || 32) || 32;
   const exact = PRESETS.find((p) => p.codec === codec && p.bitrateKbps === kbps);
   if (exact) return exact;
   if (codec === "libmp3lame") return { id: `mp3-${kbps}`, label: `MP3 ${kbps} kbps`, codec, bitrateKbps: kbps, ext: "mp3", sampleRate: 24000 };
@@ -75,13 +82,95 @@ function encodeArgs(preset, src, out) {
       out,
     ];
   }
+  const { sampleRate } = outputFormat(preset);
   return [
     ...head,
-    "-ar", String(preset.sampleRate || 24000), "-ac", "1",
+    "-ar", String(sampleRate), "-ac", "1",
     "-c:a", "libmp3lame", "-b:a", `${preset.bitrateKbps}k`,
     "-f", preset.ext,
     out,
   ];
+}
+
+/**
+ * Actual output format (sample rate / channel count) the encoder args use —
+ * single source of truth shared by encodeArgs() and the main-process meta
+ * patch, so what we record in meta.json matches what actually gets encoded.
+ */
+function outputFormat(preset) {
+  if ((preset && preset.codec) === "libopus") return { sampleRate: 16000, channels: 1 };
+  return { sampleRate: (preset && preset.sampleRate) || 24000, channels: 1 };
+}
+
+/* ---- querying the bundled ffmpeg (version / encoder list) ---------------
+ * Sandbox constraint: a spawned process's stdout CANNOT be captured through
+ * a pipe (EPERM). Work around it by passing an open file descriptor as the
+ * stdio entry — ffmpeg writes into the file itself, we read it back after
+ * the process exits, and delete it. No `child_process.exec`, no pipes. */
+
+/**
+ * Run `ffmpegPath` with `args`, capturing its combined stdout/stderr into a
+ * temp file via an open fd. Resolves the output text, or `null` on spawn
+ * failure / non-zero exit / unreadable output. The temp file is deleted.
+ */
+async function captureFfmpegOutput(args) {
+  const tag = Date.now().toString(36) + "-" + Math.floor(Math.random() * 1e9).toString(36);
+  const tmp = path.join(os.tmpdir(), "dsh-ffmpeg-probe-" + tag + ".txt");
+  let fd = null;
+  let code = -1;
+  try {
+    fd = fs.openSync(tmp, "w");
+    code = await new Promise((resolve) => {
+      let settled = false;
+      const settle = (v) => { if (!settled) { settled = true; resolve(v); } };
+      try {
+        const p = spawn(ffmpegPath, args, { stdio: ["ignore", fd, fd], windowsHide: true });
+        p.on("error", () => settle(-1));
+        p.on("close", (c) => settle(c));
+      } catch { settle(-1); }
+    });
+  } catch { code = -1; }
+  if (fd != null) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+  let content = null;
+  if (code === 0) { try { content = fs.readFileSync(tmp, "utf8"); } catch { content = null; } }
+  try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+  return content;
+}
+
+let versionCache = null;
+/**
+ * First line of `ffmpeg -version`, e.g. "ffmpeg version 7.1-full_build …".
+ * Cached after the first call. `null` when the probe cannot be run.
+ */
+async function ffmpegVersion() {
+  if (versionCache != null) return versionCache;
+  const out = await captureFfmpegOutput(["-hide_banner", "-version"]);
+  const first = out ? String(out).split(/\r?\n/)[0].trim() : null;
+  versionCache = first || null;
+  return versionCache;
+}
+
+let encoderNameCache = null;
+/**
+ * Whether the bundled ffmpeg advertises an encoder by name (e.g. "libopus").
+ * `ffmpeg -encoders` is run once and the encoder-name column is cached;
+ * a failed probe behaves as "no encoders" so callers fail clearly.
+ * @returns {Promise<boolean>}
+ */
+async function hasEncoder(name) {
+  if (encoderNameCache == null) {
+    const set = new Set();
+    const out = await captureFfmpegOutput(["-hide_banner", "-encoders"]);
+    if (out != null) {
+      for (const line of String(out).split(/\r?\n/)) {
+        // Flag column is one of A/V/S followed by dots/letters, then the name
+        const m = line.match(/^\s*([AVS][.A-Z0-9]{0,6})[ \t]+(\S+)/);
+        if (m) set.add(m[2].toLowerCase());
+      }
+    }
+    encoderNameCache = set;
+  }
+  return encoderNameCache.has(String(name).toLowerCase());
 }
 
 /**
@@ -239,6 +328,9 @@ async function archiveFile(srcPath, opts = {}) {
 
   const tmp = out + ".tmp";
   try {
+    if (!(await hasEncoder(preset.codec))) {
+      throw new Error(`编码器缺失：此 ffmpeg 未提供“${preset.codec}”编码器，无法压缩（请检查捆绑的 ffmpeg）`);
+    }
     const ok = await runFfmpeg(encodeArgs(preset, srcPath, tmp));
     if (!ok || !fs.existsSync(tmp)) throw new Error("ffmpeg 编码失败");
     const after = fs.statSync(tmp).size;
@@ -272,6 +364,16 @@ async function archiveDir(dir, opts = {}, onProgress) {
     names = fs.readdirSync(dir).filter(isWavName);
   } catch (e) {
     return { ...res, ok: false, errors: [{ file: dir, message: e.message }] };
+  }
+  /* Pre-flight: if the bundled ffmpeg lacks the target encoder, fail here with
+   * one clear error instead of one mystery failure per file. */
+  if (names.length && !(await hasEncoder(resolvePreset(opts).codec))) {
+    const codec = resolvePreset(opts).codec;
+    return {
+      ...res,
+      ok: false,
+      errors: [{ file: dir, message: `编码器缺失：此 ffmpeg 未提供“${codec}”编码器，无法压缩（请检查捆绑的 ffmpeg）` }],
+    };
   }
   let i = 0;
   for (const name of names) {
@@ -314,6 +416,9 @@ async function transcodeTo(srcPath, outPath, opts = {}) {
   const sourceDur = await probeDurationSec(srcPath); // may be null
   const tmp = outPath + ".tmp";
   try {
+    if (!(await hasEncoder(preset.codec))) {
+      throw new Error(`编码器缺失：此 ffmpeg 未提供“${preset.codec}”编码器，无法编码（请检查捆绑的 ffmpeg）`);
+    }
     const ok = await runFfmpeg(encodeArgs(preset, srcPath, tmp));
     if (!ok || !fs.existsSync(tmp)) throw new Error("ffmpeg 编码失败");
     const bytes = fs.statSync(tmp).size;
@@ -432,6 +537,10 @@ module.exports = {
   PRESETS,
   DEFAULT_PRESET_ID,
   resolvePreset,
+  outputFormat,
+  captureFfmpegOutput,
+  ffmpegVersion,
+  hasEncoder,
   estimateBytesPerHour,
   archiveFile,
   transcodeTo,

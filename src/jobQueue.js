@@ -40,6 +40,11 @@ function add(queue, job) {
     reason: job.reason || "deferred",
     sources: job.sources || [],
     durationSec: job.durationSec || 0,
+    /* Per-track capture provenance (capture.exe's READY format + T0 anchor). It
+     * MUST be whitelisted here: `add` rebuilds the job from named fields, so any
+     * field not listed is silently dropped — which is exactly how the deferred
+     * path lost the metadata the live pipeline records. */
+    captureInfo: job.captureInfo || null,
     attempts: job.attempts || 0,
     lastError: job.lastError || null,
   });

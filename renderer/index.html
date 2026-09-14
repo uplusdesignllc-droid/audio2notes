@@ -292,11 +292,13 @@
           <select id="cfg-archive-preset"></select>
         </label>
         <label class="check"><input type="checkbox" id="cfg-archive-keepwav" /> 保留原始 WAV（压缩但不再省空间）</label>
+        <p class="hint">⚠️ 勾选后压缩不省空间：一条 155 分钟、16 kHz 单声道的录音约 <b>298 MB</b>，Opus 32 kbps 压缩副本约 <b>37 MB</b>。只在需要留原始 WAV 时勾选。</p>
         <p class="hint">
-          音频统一转成 <b>16 kHz 单声道</b>——正是 Whisper 的输入格式，所以以后重新转写不受影响。
-          默认 Opus 24 kbps ≈ <b>10.8 MB/小时</b>，而 48 kHz 立体声采集 WAV 约 <b>691 MB/小时</b>。
+          音频统一转成 <b>16 kHz 单声道</b>——采样率与声道数正合 Whisper 输入，这部分不损失任何东西；
+          但编码是有损的，实测（120 秒真实语音 + base 模型）<b>16 / 24 kbps 会整句丢失并改错人名</b>，
+          故默认 <b>Opus 32 kbps ≈ 14.4 MB/小时</b>（采集 WAV 约 691 MB/小时）。
           同等语音质量下 Opus 比 MP3 小约 3 倍；只有需要把录音丢给老软件时才建议选 MP3。
-          删除前会做三重校验（编码成功 + 体积正常 + 二次解码通过），任何一步失败都保留原文件。
+          删除前会做四重校验（编码成功 + 体积正常 + 二次解码通过 + 时长一致），任何一步失败都保留原文件。
         </p>
 
         <h3>压缩已有会议音频</h3>

@@ -122,15 +122,85 @@ not.**
 - BUILD-STATE §8's heading reads as though the codec were the problem; its own body states
   the correct reason ("ffmpeg *can* encode Opus but cannot capture"). Reword the heading.
 
-### 1.10 Environment trap (this machine)
-Task Manager's CPU % is unreliable on this hybrid CPU (**Intel Core Ultra 9 285HX**,
-24 cores / 24 threads, Windows build 26200.9106): it showed **53%** while five independent
-measurements agreed on 3–20% (`\Processor(_Total)\% Processor Time` 3.7–10.6%,
-`% Processor Utility` 6.0–19.7%, hottest single logical core 48.2%, `% Idle Time`
-84.5–104.8%, per-process delta sum 1.7%), and its own clock figure matched the counters
-exactly (4.27 GHz ÷ 2.80 GHz = 152.5% ≈ `% Processor Performance` 140–153%). The counters
-are not pristine either (`% Idle Time` above 100% is impossible). **Judge Audio2Notes' cost
-by core-seconds (e.g. §8's 31,153 core-s), never by Task Manager.**
+### 1.10 CPU instrumentation on this machine — CORRECTED 2026-09-13 by calibration
+**Earlier claim withdrawn.** I first wrote that "Task Manager's CPU % is unreliable on this
+box". That generalisation was wrong; here is the measured picture.
+
+A calibration run pinned **12 of 24 threads** (ground truth = 50%, baseline 5-11%, so an
+expected ~55-61%):
+
+| instrument | reading under the known load | verdict |
+|---|---|---|
+| `\Processor(_Total)\% Processor Time` | 57.1 / 62.6 / 62.8 % | **accurate** |
+| per-process CPU-time delta sum | 55.6 % | **accurate** |
+| `\Processor Information(_Total)\% Processor Utility` | **101.8 / 107.1 %** | **broken** |
+
+So the counters used throughout this project are trustworthy, and the **broken metric is
+`% Processor Utility`** — the very one earlier invoked here as "Task Manager's own metric".
+That makes the original anomaly (Task Manager showing **53 % at idle** while two now-calibrated
+instruments said 3-20 %) most likely a bad reading on Task Manager's side, not a bad
+measurement on mine. How Task Manager derives its number could not be determined from here,
+and the case is not fully closed.
+
+What is definitely true and worth keeping:
+- **Task Manager is not generally inflated** — under real load it reads correctly. During a
+  measured local generation (49.5 % CPU / 70-77 % GPU by instrumentation) it showed ~50-55 %,
+  matching. The 53 %-at-idle reading was a one-off, and the machine's CPU+GPU graphs rising
+  and falling together is meaningful, not an artefact.
+- **One real load signature:** GPU 70-77 % **and** CPU ~50 % (llama-server alone measured
+  **1,189 % of one core ≈ 12 cores**) = the local model actively generating. That CPU cost is
+  genuine, not a display artefact, because this build uses MTP speculative decoding
+  (`draft-mtp`, `draft_num_predict 4`).
+- **GPU ~0 % with a sustained high CPU reading** is the combination that deserves a look — that
+  was the unexplained case.
+- `% Idle Time` also returned an impossible >100 % value, so the *utility/idle* family of
+  counters is the unreliable part of this platform, not the time-based ones.
+- Still prefer core-seconds (e.g. §8's 31,153 core-s) for judging Audio2Notes' own cost.
+
+### 1.11 Why local-model inference burns ~12 CPU cores — measured, and fixed
+**The cause is layers that do not fit in VRAM, not the context length.** Context size only
+matters indirectly: it sizes the KV cache, which decides how many layers fit on the GPU, and
+whatever does not fit runs on the CPU for **every** token.
+
+Causal A/B, same model, same prompt (a 500-token essay), only the context changed:
+
+| config | layers on GPU | KV cache | llama-server CPU | gen speed | GPU |
+|---|---|---|---|---|---|
+| 64k ctx (as shipped) | 64/66 — **2 on CPU** | 4096 MiB (f16) | **1,189 % of one core ≈ 11.9 cores ≈ 49.5 % of the machine** | ~23 tok/s | 74 % |
+| 8k ctx (diagnostic) | **66/66** | 512 MiB | **101 % of one core ≈ 4.2 %** | 39.0 tok/s | 96 % |
+
+The mechanism is in the log: `llama threadpool init, n_threads = 12`. llama.cpp runs the
+CPU-resident layers with a **12-thread pool per token** and then synchronises back to the GPU,
+so the CPU cost is both large and proportional to the number of tokens — and it also caps
+throughput, because every token waits on those layers. A 529-token generation and a
+48,529-token one cost the same CPU, which is what rules context size out as the driver.
+
+**Fix applied 2026-09-13 — keep the full 64k context and get full offload:**
+`OLLAMA_FLASH_ATTENTION=1` and `OLLAMA_KV_CACHE_TYPE=q8_0` (User env vars). The KV cache drops
+4096 -> **2176 MiB**, which is enough for **66/66 layers**, and:
+
+| | before | after |
+|---|---|---|
+| llama-server CPU | 1,189 % of one core (~11.9 cores) | **100 % of one core (1 core)** |
+| generation | ~23 tok/s | **36.7 tok/s** |
+| prompt processing | 52.6 tok/s | **99.5 tok/s** |
+| `size_vram` / `size` | 16.998 / 18.366 GB | **17.536 / 17.536 GB — fully resident** |
+
+Note flash attention was **already on by default** (`resolve_fused_ops: Flash Attention
+enabled`); only the KV quantisation was needed. Revert by removing the two User env vars and
+restarting Ollama.
+
+**Trap found while applying it (generalises beyond Ollama):**
+`[Environment]::SetEnvironmentVariable(name, value, "User")` writes the registry but does
+**not** update the calling process, and a child inherits the **parent process's** environment —
+so launching the app from that same shell silently starts it with the OLD variables. Set
+`$env:NAME` in the shell *before* launching (and keep the registry copy for future logins).
+The first attempt failed exactly this way: the server logged `OLLAMA_FLASH_ATTENTION:false` and
+no `OLLAMA_KV_CACHE_TYPE`, while the llama.cpp side still reported flash attention enabled —
+a confusing combination that only the server-config dump resolved.
+
+Diagnostic to keep: `GET /api/ps` -> if `size_vram < size`, part of the model is on the CPU.
+And the log line `load_tensors: offloaded N/M layers to GPU` is the authoritative answer.
 
 ## 2. Task list
 
@@ -204,13 +274,96 @@ by core-seconds (e.g. §8's 31,153 core-s), never by Task Manager.**
   `-application voip`, **ffmpeg version**, archive time, per-file before/after. Today the
   `meta` object (`main.js:696-714`) holds **no archive information at all** — the result
   exists only in the IPC return value.
-- **P3-2 settle the archive bitrate by experiment** (prerequisite for changing the default):
-  transcribe the same real multi-speaker audio from the WAV and from `opus-16/24/32/48`,
-  then diff characters, timestamps and especially proper nouns. This converts the
-  `audioArchive.js:4-6` assertion into a result and gives the default an evidence base.
-- **P3-3 expose `keepWav`** in settings (`archiveFile` already supports `opts.keepWav`,
-  `:135,155`) plus an optional "auto-keep for recordings longer than N hours" rule for
-  compliance / evidence use.
+- **P3-2 archive bitrate — MEASURED 2026-09-13; the default should move 24 → 32 kbps.**
+  Method: 120 s of real speech captured losslessly (`capture.exe record system`, 16 kHz mono),
+  then encoded through the production `transcodeTo` at 16/24/32/48 kbps and each variant
+  transcribed with the app's own `transcribeFile` (`Xenova/whisper-base.en`, which is what
+  `settings.json` uses). `silenceSkip: false` for every variant, so the **only** variable is the
+  codec — with skip enabled the codec's noise floor would change the silence detector's frame
+  decisions and inject differences unrelated to recognition. An input gate (0.5 s frame RMS,
+  p95 taken over non-floor frames) verified the source first: 113.0 s of speech in 120 s.
+
+  | variant | effective | WER | SUB | DEL | INS | edits |
+  |---|---|---|---|---|---|---|
+  | WAV lossless (reference) | — | 0.00 % | — | — | — | 0 |
+  | opus-16 | 15.8 kbps | 9.86 % | 10 | **22** | 2 | 34 |
+  | opus-24 | 23.9 kbps | 8.12 % | 9 | **18** | 1 | 28 |
+  | opus-32 | 31.9 kbps | **1.45 %** | 4 | 1 | 0 | **5** |
+  | opus-48 | 47.9 kbps | 2.90 % | 4 | 0 | 6 | 10 |
+
+  Findings:
+  - **Run-to-run noise floor is exactly 0.00 %** — transcribing the same lossless file twice
+    produced byte-identical text. The model is deterministic here, so **every** difference is
+    codec-caused. (This refuted the earlier "the non-monotonic 32 vs 48 result is jitter"
+    guess; the 5-vs-10 edit difference at 32/48 is a small-sample effect on 345 words, not a
+    trend.)
+  - **The 16/24 kbps errors are dominated by deletions**, and the edit backtrace shows one
+    **contiguous ~20-word run** — an entire sentence dropped — not scattered degradation.
+    opus-24's hypothesis text even inserts "you know" and then loses the following sentence.
+  - **Proper nouns are mangled at 16/24 and intact at 32/48**: `bristol → crystal`,
+    `at → peric`/`favorite`, `writing → riding`, `company's → companies`,
+    `restalwest → restylwest`, while `bristol west` survives at 32/48.
+  - **Effective bitrate ≈ target** (15.8 / 23.9 / 31.9 / 47.9 kbps on speech-dominant content),
+    which **retires the earlier worry** that `estimateBytesPerHour`'s constant-bitrate maths
+    would be materially optimistic. (It may still overestimate material that is mostly
+    silence — see the first, invalid run, where a speechless 150 s file encoded to ~2-4 kbps.)
+  - `transcodeTo`'s new duration verification (P0-3) ran on all four real 120 s encodes without
+    complaint.
+
+  Recommendation: **default `opus-32`.** 155-minute meeting ≈ 37 MB vs 28 MB at 24 kbps — a
+  9 MB difference against ~298 MB of recording — in exchange for not dropping a sentence and
+  not mangling names, on an irreversible format.
+
+  Caveats: one 120 s sample; the ASR is `whisper-base.en` (weak, and it is the project default,
+  so it is the relevant model); a stronger model might be more robust to codec artefacts and
+  could change the verdict.
+- **P3-3 `keepWav` — DONE ALREADY; the backlog entry was wrong (corrected 2026-09-13).**
+  This item claimed "expose `keepWav` in settings … just not exposed". That was an unverified
+  inference and it was false: the checkbox was already fully wired —
+  `renderer/index.html:294` (`id="cfg-archive-keepwav"`, label "保留原始 WAV（压缩但不再省空间）"),
+  loaded at `renderer/app.js:130`, saved at `renderer/app.js:205` through the normal `config:set`
+  path, and `src/main.js:451` passes the whole `cfg.audio.archive` object to
+  `audioArchive.archiveDir(dir, opts, …)` so `keepWav` reaches the encoder unmodified.
+  The only real gap was documentation: a hint line was added at `renderer/index.html:295`
+  giving the disk trade-off (a 155-minute 16 kHz mono recording ≈ 298 MB vs an Opus 24 kbps
+  copy ≈ 28 MB). The optional "auto-keep for recordings longer than N hours" rule is still
+  unimplemented and remains open.
+  **Lesson (third instance of this pattern):** an inference about this codebase has now been
+  wrong three times (this item; the `.tools` ffmpeg fallback, which I nearly called dead code;
+  and the "Task Manager CPU is inflated" generalization). Verify against the file itself
+  before writing a claim — including into this document.
+- **P3-5 the deferred/queue path loses capture provenance — FIXED 2026-09-13.**
+  `captureInfo` (per-track `READY` format + `T0` anchor) is stashed on `rec` and written into
+  `meta.capture` only by `stopRecordingAndProcess()`. In "续航优先模式" the recording is queued
+  via `enqueueMeeting()` and processed later, so those meetings got `meta.audio` (patched by
+  `archiveMeeting`) but no `meta.capture`.
+  **The real mechanism was one level deeper than it looked:** `jobQueue.add()` rebuilds every job
+  from a *named-field whitelist*, so a `captureInfo` handed to it is silently dropped — carrying
+  the value through `enqueueMeeting()` alone would have changed nothing. Fixed in four places:
+  whitelist it in `jobQueue.add()` (with a comment saying why that list is load-bearing), take it
+  as a parameter in `enqueueMeeting()`, pass `rec.captureInfo` from the sole call site, and write
+  `capture: job.captureInfo || null` into the queued `meta`.
+  Verified by a unit test: `add` / `save`+`load` / `markAttempt` all preserve it, an absent field
+  yields `null`, and a pre-existing `queue.json` without the field still loads and is still
+  returned by `nextJob()` (`meta.capture` falls back to null rather than throwing).
+- **P2-6 (NEW, found and fixed 2026-09-13): a stale LEVEL line defeats the silence watchdog.**
+  `capture.exe` advanced its LEVEL odometer only inside the packet loop, and the silence-padding
+  path did not touch it. During a silence long enough that no packets arrive, the `--status`
+  file's **last line stays frozen at the last loud `LEVEL`**; `main.js`'s `pollLevels()` reads
+  that last line every 300 ms and refreshes `lifecycle.lastLoudAt` whenever it is at or above the
+  speech threshold — so the 10-minute silence watchdog ("forgot to stop the recording") **never
+  fired**. Pre-existing (the old code had the same staleness whenever the endpoint went idle),
+  not introduced by the padding work.
+  Fix: the padding path advances the odometer by the frames it wrote and emits one LEVEL line per
+  completed window, reusing the existing computation verbatim, with the window count and
+  remainder computed in 64-bit before narrowing. Padded frames are real elapsed time — and since
+  padded samples are silence, the existing smoothing decays the reported level to 0 by itself.
+  Verified: **12 s with nothing playing now yields 24 LEVEL lines where it yielded 0 before**,
+  `bytes=384000` exactly, file 384044, decodes clean. A 12 s capture in which a tone starts 6 s in
+  yields exactly 24 lines whose **first 13 are `LEVEL 0` followed by 14,13,12,…** — the transition
+  lands precisely where the audio begins, which is what makes LEVEL a wall-clock signal again.
+  Real audio still reports non-zero levels; the fuse still emits `LIMIT` before `FINISHED`; a run
+  without `--limit-bytes` still emits none.
 - **P3-4 pre-flight ffmpeg capability:** require `libopus` in `-encoders` before archiving;
   otherwise skip, keep the WAV and say so (today only a missing binary is reported, and
   BUILD-STATE §6b records that this binary has gone missing before).
