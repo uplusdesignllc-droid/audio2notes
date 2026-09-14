@@ -45,7 +45,7 @@ function lifecycleCfg() {
     confirmWhileBusy: l.confirmWhileBusy !== false,
     autoStop: {
       enabled: a.enabled !== false,
-      silenceMin: typeof a.silenceMin === "number" ? a.silenceMin : 10,
+      silenceMin: typeof a.silenceMin === "number" ? a.silenceMin : 2,
       forceStopAfterMin: typeof a.forceStopAfterMin === "number" ? a.forceStopAfterMin : 5,
       minFreeDiskGB: typeof a.minFreeDiskGB === "number" ? a.minFreeDiskGB : 2,
       maxElapsedMin: typeof a.maxElapsedMin === "number" ? a.maxElapsedMin : 480,

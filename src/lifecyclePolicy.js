@@ -25,7 +25,7 @@ function evaluate(state, cfg, now) {
     state || {}
   );
   const as = (cfg && cfg.autoStop) || {};
-  const silenceMin = typeof as.silenceMin === "number" ? as.silenceMin : 10;
+  const silenceMin = typeof as.silenceMin === "number" ? as.silenceMin : 2;
   const forceStopAfterMin = typeof as.forceStopAfterMin === "number" ? as.forceStopAfterMin : 5;
   const minFreeDiskGB = typeof as.minFreeDiskGB === "number" ? as.minFreeDiskGB : 2;
   const maxElapsedMin = typeof as.maxElapsedMin === "number" ? as.maxElapsedMin : 480;

@@ -49,8 +49,8 @@ const DEFAULTS = {
     confirmWhileBusy: true,   // never let a window close silently kill a recording/pipeline
     autoStop: {
       enabled: true,          // stop a forgotten recording
-      silenceMin: 10,         // minutes without speech before warning
-      forceStopAfterMin: 5,   // minutes after the warning before stopping anyway
+      silenceMin: 2,          // minutes without speech before WARNING (harmless: recording continues)
+      forceStopAfterMin: 5,   // further minutes AFTER the warning before actually stopping (total 7)
       minFreeDiskGB: 2,       // stop recording when free space drops below this
       maxElapsedMin: 480,     // stop once a recording has run this long (0 = no time limit)
       levelThreshold: 8,      // LEVEL (0-100) counted as "speech" by capture.exe

@@ -136,7 +136,7 @@ async function loadConfig() {
   $("cfg-autoquit").value = String(typeof lc.autoQuitAfterMin === "number" ? lc.autoQuitAfterMin : 15);
   $("cfg-confirm-busy").checked = lc.confirmWhileBusy !== false;
   $("cfg-autostop").checked = as.enabled !== false;
-  $("cfg-silence-min").value = typeof as.silenceMin === "number" ? as.silenceMin : 10;
+  $("cfg-silence-min").value = typeof as.silenceMin === "number" ? as.silenceMin : 2;
   $("cfg-forcestop-min").value = typeof as.forceStopAfterMin === "number" ? as.forceStopAfterMin : 5;
   $("cfg-mindisk-gb").value = typeof as.minFreeDiskGB === "number" ? as.minFreeDiskGB : 2;
 
@@ -211,7 +211,7 @@ $("btn-save").addEventListener("click", async () => {
       confirmWhileBusy: $("cfg-confirm-busy").checked,
       autoStop: {
         enabled: $("cfg-autostop").checked,
-        silenceMin: Number($("cfg-silence-min").value) || 10,
+        silenceMin: Number($("cfg-silence-min").value) || 2,
         forceStopAfterMin: Number($("cfg-forcestop-min").value) || 5,
         minFreeDiskGB: Number($("cfg-mindisk-gb").value) || 0,
       },
