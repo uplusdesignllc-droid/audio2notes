@@ -381,6 +381,30 @@ And the log line `load_tensors: offloaded N/M layers to GPU` is the authoritativ
   before mixing, or detect and record it. Low priority (negligible for word-level dedupe) but
   it belongs in the list.
 
+### P5 — dependency audit (do this deliberately, before the repo is made public)
+- **P5-1 the Dependabot alerts.** GitHub reports **14 vulnerabilities (1 critical, 8 high,
+  5 moderate)** on the default branch — the same count as BUILD-STATE §8 recorded, unchanged
+  by this work because no dependency version was touched. Run `npm audit` (with
+  `npm_config_cache` set — see BUILD-STATE §7) and clear what is genuinely clearable, one
+  dependency at a time, re-running the app and the packaging verification after each.
+- **P5-2 `sharp` — DO NOT merge the bump blindly.** Two Dependabot branches now exist on
+  origin: `dependabot/npm_and_yarn/js-yaml-4.3.2` (low risk) and
+  **`dependabot/npm_and_yarn/sharp-0.35.4` (high risk)**. `sharp` is load-bearing and BUILD-STATE
+  §6b documents exactly why: `@xenova/transformers` pins `sharp@^0.32.6`, so npm kept a *nested*
+  copy that never fetched its native binary under `--ignore-scripts`, and that surfaced only as
+  `Cannot find module sharp-win32-x64.node` **in the packaged app**. It was fixed by three things
+  acting together: npm `"overrides": { "sharp": "0.33.5" }`, the direct dependency pinned to the
+  *exact* same version (npm rejects an override that differs from the direct spec), and
+  `asarUnpack: ["node_modules/@img/**"]` so the `.node`/libvips DLLs live outside asar. Bumping
+  sharp moves all three. The danger is that a broken sharp is **invisible in development** and
+  only shows up in the packaged exe, so this must be done as its own task with the full
+  verification: update `overrides` and the direct spec together, confirm `@xenova/transformers`
+  still resolves to the intended sharp, confirm the nested copy is still absent, then **rebuild
+  the portable exe and launch it for real** (BUILD-STATE §6b, including the EPERM workaround:
+  `--config.electronDist=dist/electron-dist-44.3.0`).
+- **P5-3 note:** `@xenova/transformers` 2.x is superseded by `@huggingface/transformers`. That is
+  a migration with its own verification burden, not an audit fix — keep it out of P5-1/P5-2.
+
 ## 3. Investigated and rejected (with the real reasons)
 - **Recording straight to Ogg/Opus** — loses "a hard kill still yields a decodable file" and
   makes `capture.exe` depend on libopus. The only genuine route would be encoding inside
@@ -440,6 +464,20 @@ And the log line `load_tensors: offloaded N/M layers to GPU` is the authoritativ
   the repo root. **Do not prefix with `node`** (see §7.4). `electron.exe` is a GUI-subsystem
   binary, so the shell returns immediately and the terminal looks idle — the window is
   elsewhere, and that terminal is where the main-process console output appears.
+- Capture that console output to a file so a run can be diagnosed afterwards (works for the
+  dev instance; §8 records that the portable exe flushes unreliably):
+  `npm.cmd start *> .scratch\app-run.log`
+- Post-change health check over every meeting directory (read-only, no child processes):
+  `node tools\audit-meetings.js` — `--since YYYY-MM-DD` scans further back, `--json` for
+  machine output, exit code 1 means ERROR/WARN findings exist.
+- **Push: `git -c http.sslBackend=openssl push`, and it NEEDS full access.** The workspace
+  sandbox denies the named pipe git's credential helper needs (through sh/bash) — without
+  escalation it dies with `couldn't create signal pipe, Win32 error 5` / `failed to execute
+  prompt script (exit code 66)` / `could not read Username for 'https://github.com'`, exit 128.
+  The `sslBackend=openssl` flag is also required (schannel gives `SEC_E_NO_CREDENTIALS`).
+  Verified 2026-09-14: `db8207c..dcd3326  main -> main`, exit 0, re-checked with `git fetch`
+  (`main...origin/main`, no "ahead"). Never write credentials into git config, remotes or files;
+  the Windows credential manager supplies auth.
 
 ## 7. P0 completion + findings from the real-recording test (2026-09-13)
 
