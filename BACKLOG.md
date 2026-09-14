@@ -439,6 +439,38 @@ Separate, small bug found while looking: **`speaker-rows` appears twice as an id
 `renderer/index.html` (lines 93 and 167). Duplicate ids are invalid HTML and `$("speaker-rows")`
 silently returns only the first; one of the two needs a different id.
 
+**The owner's requested shape (2026-09-14):** a **popup/modal**, shown **automatically at the
+moment manual input is needed**, carrying an explicit **「不需要更改参会人」** option so it can be
+dismissed in one click. Deliberately NOT a settings screen and not the row-editing list that
+exists today — a modal that interrupts once and can be waved away.
+
+That makes the open question *when* "input is needed" fires. Three candidates, and the tradeoff
+is real:
+
+- **(a) at stop, before processing** — the only moment at which the typed names can ALSO feed
+  option 2 below (Whisper's prompt), i.e. the only variant that improves recognition rather than
+  just relabelling. Cost: it interrupts after every meeting, which is exactly why the
+  「不需要更改参会人」 button and a persisted "don't ask automatically again" preference matter.
+- **(b) once the notes are ready** — no interruption during processing, but the names can only
+  relabel. The plumbing for that already exists: `speakersSetName` refreshes the notes
+  (`src/main.js:~1034`), so naming after the fact costs a regeneration instead of an ASR win.
+- **(c) when the user opens a meeting that has unnamed speakers** — least intrusive, zero ASR
+  benefit; this is closest to what exists today, only promoted from a section to a modal.
+
+Recommendation: **(a) with the skip option**, because it is the only variant that pays for itself
+in transcript quality; fall back to (b)/(c) if it turns out to nag.
+
+⚠ **Verify before designing around (a):** whether `@xenova/transformers` 2.x actually accepts a
+prompt / `initial_prompt` for Whisper generation. `transcribe.js:~291` currently passes only
+`chunk_length_s`, `stride_length_s`, `return_timestamps` and `callback_function`. Whisper itself
+supports an initial prompt, but this binding's support is unverified — do not promise an ASR
+benefit until it is checked.
+
+**Observability gap noticed during the 2026-09-14 acceptance run:** `meta.stopReason` is only ever
+set to `"max-duration"`. The meeting that ending via the meeting-app-quiet rule recorded nothing,
+so which mechanism stopped a recording has to be inferred from timings. The renderer knows the
+reason when it calls `record:stop` for an auto-stop-request — pass it through and record it.
+
 ## 3. Investigated and rejected (with the real reasons)
 - **Recording straight to Ogg/Opus** — loses "a hard kill still yields a decodable file" and
   makes `capture.exe` depend on libopus. The only genuine route would be encoding inside
