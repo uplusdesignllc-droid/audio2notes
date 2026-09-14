@@ -131,6 +131,24 @@ function auditMeeting(rootDir, name, since) {
   const add = (severity, check, message) =>
     findings.push({ severity, check, message });
 
+  /* A meeting whose directory was touched moments ago is almost certainly still
+   * being processed — mixing, transcribing, summarizing — so the "artifact is
+   * missing" checks below would be false alarms. This tool exists to look at a
+   * FINISHED meeting; crying wolf while the pipeline is mid-flight is worse than
+   * useless, because it trains the reader to ignore the output. */
+  const IN_FLIGHT_MS = 20 * 60 * 1000;
+  let newestMtime = 0;
+  for (const f of files) {
+    try {
+      const st = fs.statSync(path.join(dir, f));
+      if (st.mtimeMs > newestMtime) newestMtime = st.mtimeMs;
+    } catch { /* ignore */ }
+  }
+  const inFlight = newestMtime > 0 && Date.now() - newestMtime < IN_FLIGHT_MS;
+  const inFlightNote = inFlight
+    ? ` — the directory was modified ${Math.round((Date.now() - newestMtime) / 1000)} s ago, so the pipeline looks like it is still running`
+    : '';
+
   // ---- meta.json ----------------------------------------------------------
   const hasMetaFile = set.has('meta.json');
   let meta = null;
@@ -138,12 +156,12 @@ function auditMeeting(rootDir, name, since) {
     meta = readJsonOrNull(path.join(dir, 'meta.json'));
     if (meta == null) add('ERROR', 'meta-missing', 'meta.json is present but not valid JSON');
   } else {
-    add('ERROR', 'meta-missing', 'meta.json is missing');
+    add(inFlight ? 'INFO' : 'ERROR', 'meta-missing', `meta.json is missing${inFlightNote}`);
   }
 
   // ---- required artifacts -------------------------------------------------
-  if (!set.has('transcript.json')) add('ERROR', 'transcript-missing', 'transcript.json is missing');
-  if (!set.has('notes.md')) add('ERROR', 'notes-missing', 'notes.md is missing');
+  if (!set.has('transcript.json')) add(inFlight ? 'INFO' : 'ERROR', 'transcript-missing', `transcript.json is missing${inFlightNote}`);
+  if (!set.has('notes.md')) add(inFlight ? 'INFO' : 'ERROR', 'notes-missing', `notes.md is missing${inFlightNote}`);
 
   // ---- check 2: tiny .opus ------------------------------------------------
   for (const f of files) {
@@ -189,7 +207,7 @@ function auditMeeting(rootDir, name, since) {
     }
     const cap = meta && meta.capture;
     if (cap == null) {
-      add('INFO', 'capture', `meta.capture absent (recorded before that field existed); status files report ${tracksSeen.map((t) => `${t}=${readyFmt[t]}`).join(', ')}`);
+      add('INFO', 'capture', `meta.json has no capture field (either recorded before it existed, or meta is not written yet); status files report ${tracksSeen.map((t) => `${t}=${readyFmt[t]}`).join(', ')}`);
     } else if (typeof cap !== 'object' || Array.isArray(cap)) {
       add('WARN', 'capture', `meta.capture has unexpected shape: ${JSON.stringify(cap)}`);
     } else {
