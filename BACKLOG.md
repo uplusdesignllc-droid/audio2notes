@@ -1221,7 +1221,9 @@ request's `num_ctx`:
 | scenario | requests | recorded sequence | old code would have sent |
 |---|---|---|---|
 | short transcript, detailed, + notes translation | 4 | `[16384 ×4]` | 3 distinct contexts = **3 model loads** |
-| adversarial: map + 3 merge rounds + final + translation | 36 | `[32768 ×36]` | 4 distinct contexts = **4 model loads** |
+| default config, 130 000-char transcript | 21 | `[32768 ×21]` | 4 distinct contexts = **4 model loads** |
+| transcript translation ON (translate runs first), 130 000 chars | 80 | `[32768 ×80]` | 4 distinct contexts = **4 model loads**, 59 of them at Ollama's *default* because `translate.js` sent no `num_ctx` at all |
+| adversarial: 80 map chunks, 3 reduce rounds, final pass at the 80 000-char ceiling | 152 | `[32768 ×152]` | 4 distinct contexts = **4 model loads** |
 
 Every request in both scenarios also satisfies `num_ctx >= ctxFor(promptChars, numPredict)` for its
 own prompt, and `st.raises` stayed **0** — the plan was never wrong.

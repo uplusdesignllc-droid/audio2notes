@@ -132,16 +132,23 @@ function runSuite(file) {
  *  same two scenarios re-derived for the current contract (it passes) and stays out
  *  until whoever owns meetingDetect accepts that re-derivation, because editing
  *  assertions until they are green is exactly what the .stale.js files record. */
-const NOT_RUN = [
-  {
-    why: "stale suite, asserts a superseded contract (see file header)",
-    files: ["p2-5.stale.js", "p2-5-verify.stale.js"],
-  },
-  {
-    why: "re-derived for the current contract, pending owner review (see file header)",
-    files: ["p2-5.rederived.js", "p2-5-verify.rederived.js"],
-  },
-];
+/* RESOLVED 2026-09-15 — this used to hold two groups and it was the wrong answer.
+ *
+ * The "stale" pair were byte-faithful copies of the .scratch originals: they assert
+ * the pre-eaf29dc meetingDetect contract, where ONE Active observation earned the
+ * latch, while src/meetingDetect.js:78 now requires startAfterSec (15 s) of
+ * CONTINUOUS activity (the chat-app notification false-stop fix). The "rederived"
+ * pair were the same scenarios re-derived for the current contract and they PASSED.
+ *
+ * Holding either pair out of the run silently dropped the meetingDetect coverage from
+ * `npm test` — 16 suites instead of 18 — which is the same failure mode as leaving
+ * them red: the suite stops telling you anything about that module. The re-derived
+ * pair now runs under its own name (p2-5.test.js / p2-5-verify.test.js) and the
+ * duplicates are gone; the .scratch originals stay for the record.
+ *
+ * The mechanism is kept, empty, rather than deleted: a future NOT-RUN group has an
+ * obvious home, and `reportNotRun()`'s call site does not have to move. */
+const NOT_RUN = [];
 
 function reportNotRun() {
   for (const group of NOT_RUN) {
