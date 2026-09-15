@@ -1036,7 +1036,8 @@ not the answer. Requiring **≥ 1.0 s of *continuous* detected speech** gives **
 every threshold from 0.3 to 0.9**, while keeping 82.0 s of the 117 s of real audio (vs 83.8 s at a
 0.5 s requirement); on the control it keeps 700.3 s of 746.6 s. Low cost, robust, not knife-edge.
 
-So the shape is: per-track VAD → `isDetected()` state → activity only once a speech run reaches 1.0 s
+So the shape is: per-track VAD → `isDetected()` state → activity only once a speech run reaches a
+duration bar (**§10.7 measures that bar: it should be 2.0 s, not 1.0 s**)
 → the guard counts silence while no track is in speech. That **replaces the 12 s / 4 s duty cycle**
 (`activityTracker.js`), which exists only to approximate this from a loudness signal; keep the duty
 cycle as the fallback for when the model is absent or the download was declined.
@@ -1068,3 +1069,43 @@ evidence that it is a poor proxy for speech.
 `curl: (35) schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030e)`, with no
 proxy configured. The model was fetched successfully through **Node's own TLS stack** instead. Any
 future download here must go through Node, not schannel.
+
+### 10.7 The duration bar is the load-bearing part — and 1.0 s is too low
+
+The owner's argument: 「即便是语音而误判，如果不是连续的语音很短促在一秒级别，也没有实际意义…
+没有人会在会议里隔一段时间发出一个没有意义的语音信号」 — an isolated ~1 s signal carries no
+information about whether a meeting is ongoing, so ignoring it is not a compromise but the correct
+semantics. Measured with `.scratch/gap-analysis.js` (offline VAD intervals at `threshold 0.5`, the two
+tracks unioned, "continuous ≥ N" approximated by keeping bursts of length ≥ N):
+
+| recording | duration bar | longest silence gap | would the 5-min rule stop it? |
+|---|---|---|---|
+| `094817` — a real 19.6-min meeting | none | **83.8 s** | no |
+| | ≥ 1.0 s | 83.8 s | no |
+| | **≥ 2.0 s** | **103.8 s** | no |
+| | ≥ 3.0 s | 114.6 s | no |
+| `203332` — really over at 119.5 s | none | **299.8 s** | **no — by 0.2 s** |
+| | ≥ 1.0 s | **679.7 s** | **yes** (correct) |
+
+Three consequences:
+1. **The bar can be far higher than 1.0 s at essentially no cost.** On a real meeting, even a 3.0 s bar
+   leaves the longest natural silence at 114.6 s — **2.6×** below the 300 s threshold — so no moment of
+   that meeting would ever be misread as "the meeting is over".
+2. **With no bar the rule is a coin flip.** `203332` with no duration bar reaches a 299.8 s silence,
+   **0.2 s short of the trigger**; only the chime leaks kept it alive. With a ≥1.0 s bar the gap jumps
+   to 679.7 s and it stops correctly. The shipped LEVEL duty cycle has the same thinness: LEVEL reports
+   chimes as 2.0–3.0 s against a 4 s requirement, a **1.33×** margin.
+3. **"Speech seconds kept" is the wrong metric, and this proves it.** Raising the bar from 0 to 3.0 s
+   drops kept speech from 752.6 s to 491.2 s — a third of it — while the guard's *verdict* does not
+   change once. Only "would it wrongly declare a live meeting over" counts, so do not let a kept-speech
+   number talk you out of a higher bar.
+
+**Recommended enforcement operating point: `threshold 0.75` + a ≥ 2.0 s bar.** That is **≈3.1×** of
+margin over the two measured leaks (0.640 s / 0.672 s) while keeping **2.9×** of margin against the real
+meeting's longest natural silence (103.8 s vs 300 s). A 1.0 s bar leaves only 1.4× over the leaks, which
+a two-tone "ding-dong" chime of 1.5–2 s would cross.
+
+⚠ **n = 1 real meeting, and `094817`'s mic track detected only 7.26 s**, so this conclusion is carried
+almost entirely by the system track. The shadow-mode data from several real meetings is what should fix
+the bar properly — and §10.7's question ("does the rule ever declare a live meeting over?") is how to
+judge it, not the kept-speech total.
