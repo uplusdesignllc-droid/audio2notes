@@ -631,12 +631,35 @@ function scanLimitLine(text) {
  * every ~0.5 s, so a poll sees 0, 1 or several NEW lines. `r.levelSeen` counts
  * the LEVEL lines already fed to the tracker, so a line is observed exactly once;
  * the new ones go in as ONE batch with capture-time timestamps (pushBatch),
- * keeping the duty cycle in capture time instead of poll time. */
+ * keeping the duty cycle in capture time instead of poll time.
+ *
+ * WHY CAPTURE TIME AND NOT Date.now() (measured 2026-09-15, BACKLOG §11.3):
+ * stamping with the poll clock gives every track the wall-clock time of its OWN
+ * poll, and the two tracks' 300 ms timers run out of phase, so one sound arriving
+ * on both tracks landed at two timestamps up to ~300 ms apart — the same instant
+ * then looked like two different instants to the tracker, which is what let a
+ * chime heard on both tracks count twice. The writer already publishes its exact
+ * timebase: `T0 qpc=<n> freq=<n> unixms=<n>` is emitted once, right after Start,
+ * and LEVEL line i is written i * rate/2 frames after that anchor (0.5 s at the
+ * rates in use). So sample i happened at `t0.unixms + i * 500` ms — a timebase the
+ * codebase already trusts for cross-track alignment to well under a millisecond
+ * (tools/audit-meetings.js check 5 compares the two T0 anchors directly). Both
+ * tracks then place one sound at (nearly) the same timestamp.
+ *
+ * Fallback: T0 is emitted after READY, so a poll that arrives before the anchor
+ * is on disk (or a status file that was rewritten without one) must not DROP
+ * samples — it stamps them from the last known capture time, and only the very
+ * first such poll falls back to the poll clock. */
 function pollLevels() {
   for (const key of ["system", "mic"]) {
     const r = rec[key];
     if (!r) continue;
     r.levelSeen = 0; // per recording: the status file starts empty
+    /* Capture-time bookkeeping, per recording (rec[key] is rebuilt by
+     * record:start): t0Ms is the writer's unix-ms anchor, levelMs the newest
+     * capture timestamp handed to the tracker so far. */
+    r.t0Ms = null;
+    r.levelMs = null;
     const timer = setInterval(() => {
       let level = null;
       let fresh = null;
@@ -650,6 +673,16 @@ function pollLevels() {
         // several, or (after a stall/sleep) a whole backlog.
         let count = 0;
         for (const ln of lines) if (ln.startsWith("LEVEL ")) count++;
+        /* Parse the T0 anchor once, while no LEVEL line has been fed yet. It is
+         * written before every LEVEL line, so a file that already has lines on
+         * the very first poll still carries it. */
+        if (count > 0 && r.levelSeen === 0 && r.t0Ms === null) {
+          const t0 = parseCaptureStatus(text).t0;
+          if (t0) {
+            const ms = Number(t0.unixms);
+            if (Number.isFinite(ms) && ms > 0) r.t0Ms = ms;
+          }
+        }
         if (count > r.levelSeen) {
           fresh = [];
           for (let i = lines.length - 1; i >= 0 && fresh.length < count - r.levelSeen; i--) {
@@ -657,6 +690,13 @@ function pollLevels() {
             if (lm) fresh.push(Math.max(0, Math.min(100, +lm[1])));
           }
           fresh.reverse(); // chronological: oldest first, newest last
+          /* Stamp the batch in CAPTURE time: LEVEL line `count - 1` (the newest
+           * one in the file) is written (count - 1) * 0.5 s after the anchor —
+           * pushBatch walks the rest of the batch backwards from there. With no
+           * anchor (first poll before T0 is on disk, or a rewritten file) the
+           * newest stamp stays the poll clock, exactly as it always was: a
+           * missing anchor must degrade the timestamps, never drop samples. */
+          r.levelMs = r.t0Ms === null ? Date.now() : r.t0Ms + (count - 1) * 500;
           r.levelSeen = count;
         } else if (count < r.levelSeen) {
           r.levelSeen = count; // status file rewritten/truncated: resync, never stall
@@ -687,7 +727,7 @@ function pollLevels() {
       // The meter must still see EVERY sample, not only the ones that count as
       // activity — send() is unconditional by design.
       if (level != null) send("level", { source: r.kind, level });
-      if (fresh && fresh.length && activity) activity.pushBatch(fresh, Date.now());
+      if (fresh && fresh.length && activity) activity.pushBatch(fresh, r.levelMs !== null ? r.levelMs : Date.now());
 
       /* The forgotten-recording guard asks "is this meeting still going", not
        * "was this one sample loud": a 2.5 s notification beep (peaks 27-31) must

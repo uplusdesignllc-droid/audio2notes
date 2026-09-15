@@ -1186,3 +1186,90 @@ skim.
 Also noted, not new: `translationSkipped = "transcript-disabled"`, 2 noise-only chunks
 (`"[ Silence ]"`, `"[ ] [BLANK_AUDIO]"` — see the noise-chunk cleanup item), and the 4 leftover
 `.status`/`.stop` files (P4-4).
+
+## 12. The four §11 defects fixed (2026-09-15, second round)
+
+### 12.1 `src/activityTracker.js` + `pollLevels` — the double-count (fix, in two layers)
+1. **Capture-time stamping.** `pollLevels()` used to stamp each batch with its own `Date.now()`, and
+   the two tracks' 300 ms pollers run out of phase, so one sound arriving on both tracks was recorded
+   at two timestamps up to ~300 ms apart. It now reads the writer's own timebase — `T0 … unixms=<n>`,
+   already trusted for cross-track alignment — and stamps LEVEL line *i* at `T0.unixms + i*500`.
+   Verified through the **real** `pollLevels` (`.scratch/pollLevels.harness.js`):
+   `levelMs == T0.unixms + (levelSeen-1)*500`, and a poll-clock stamp would have been **7695 ms** later.
+2. **Measure of the union, not a sum.** `loudMsIn()` used to add `sampleMs` for every loud sample
+   regardless of origin, so a sound on both tracks counted twice. It now computes the union of the
+   samples' `[at - sampleMs, at]` intervals. Unit evidence: two samples at ONE timestamp measure
+   **500 ms where the sum said 1000 ms**, and a 2.5 s chime heard on both tracks measures
+   **2600-2900 ms against the 4000 ms requirement → correctly rejected** (the sum said 5000 ms and
+   accepted it). The residual above 2500 ms is the real sub-grid track offset seen as genuine cover,
+   not double-counting — do not read the fix as "exactly 2500 ms".
+
+### 12.2 `src/ctxPin.js` — one `num_ctx` per run (fix)
+`ctxFor()` picked a context per request and Ollama reloads the whole 17.3 GB model whenever the
+served context changes. A new module owns the run's pinned value: `declareRun(cfg, {transcriptChars,
+numPredictMax, label})` sizes it once from the transcript length, and `numCtxFor(cfg, chars, predict)`
+returns that pin for every call of every stage. The invariant that makes it safe is explicit in the
+code: the pin is the maximum `ctxFor()` over every request shape the run can produce, and if a
+request would still not fit, **`raise()` grows the pin and warns loudly rather than truncating** —
+one extra reload is accepted, a silently truncated prompt is not. `CHUNK_CHARS` /
+`MAX_CHUNK_CHARS` moved into the module as well, so the chunker and the context planner cannot drift
+apart.
+
+Measured by `test/numctx-pin.test.js`, which replays the whole pipeline shape and records every
+request's `num_ctx`:
+
+| scenario | requests | recorded sequence | old code would have sent |
+|---|---|---|---|
+| short transcript, detailed, + notes translation | 4 | `[16384 ×4]` | 3 distinct contexts = **3 model loads** |
+| adversarial: map + 3 merge rounds + final + translation | 36 | `[32768 ×36]` | 4 distinct contexts = **4 model loads** |
+
+Every request in both scenarios also satisfies `num_ctx >= ctxFor(promptChars, numPredict)` for its
+own prompt, and `st.raises` stayed **0** — the plan was never wrong.
+
+### 12.3 `tools/audit-meetings.js` — `tmp-probe` in-flight exemption (fix)
+Check 10 now takes the same `inFlight` verdict the missing-artifact checks use, so the designed
+`<out>.tmp` of a running archive is **INFO** instead of WARN. It is a **downgrade, not a silence**:
+verified three ways — finished meeting `WARN 0`; a 3-hour-stale directory with a `.tmp` still reports
+`WARN 1`; a fresh directory with the same `.tmp` reports INFO with the explanatory note.
+
+### 12.4 Tests moved out of the gitignored `.scratch/` (fix)
+`test/` is now tracked, with `test/fixtures.js` centralising fixture access: `FIXTURE_ROOT` is
+overridable via `A2N_FIXTURE_ROOT`, `have()` tests existence, and `skip()` prints a greppable
+`SKIP  <what>: missing <path>` line so a data-dependent suite **exits 0 without the fixture** instead
+of failing. `npm test` runs the suites.
+
+### 12.5 PROCESS LESSON — a stopped agent is not a stopped agent
+Two agents in a row have now been interrupted, reported that they had stopped, and then **kept
+writing for minutes to hours** (`src/main.js` 09:41:37 and `src/activityTracker.js` 09:42:48, after
+an interrupt requested at 09:41; the P6 agent wrote for ~2.5 h after its). Two consequences worth
+carrying forward:
+- **Re-check `git status` before acting on a stopped agent's silence.** A claim of "nothing was
+  written" is only true as of the moment it is checked.
+- **Verify what an interrupted agent left behind rather than assuming it is garbage — and rather
+  than assuming it is good.** This round's Fix 1 was written that way, and it was correct; its test
+  harness was not (below), so both directions of assumption would have been wrong.
+
+### 12.6 The harness's own fixture bugs, and two false alarms I raised
+`pollLevels.harness.js` arrived failing three checks. All three were **the fixture, not the code**:
+it placed the mic's samples 10.5 s after the system's (so it measured the union of two *different*
+sounds), it marked ten 0.5 s samples loud while calling the result "a 2.5 s chime" (ten samples is
+5 s, which by this rule genuinely IS activity), and it appended 24 lines at once so the samples'
+capture-time stamps ran ~9.5 s into the future, where the tracker correctly ignores them. Fixed in
+the fixture; one comparison label was also corrected because it still claimed to demonstrate the old
+summing counter after the code no longer summed.
+
+Two alarms I raised and then retracted, both measurement artefacts of the same family as §1.10:
+1. A harness `ReferenceError` at "main.js:2183" looked like a broken main process. `main.js` was
+   clean at 2181 lines — the line number was a *virtual* one from the concatenated source the harness
+   compiles in memory. The real fault was the harness's own appended tail, which referenced two
+   names that do not exist in `main.js` (`createActivityTracker` is `activityTracker.createActivityTracker`;
+   `exactNumber` never existed).
+2. I suspected subagents were being routed to the **retired :11435** llama.cpp server. Wrong: the
+   config points at the live `http://127.0.0.1:11434/v1`, and `netstat` shows only 11434 listening.
+   The 43-minute stall with **zero** model calls coincided with the laptop running on battery in
+   Windows power-saving; once mains power returned the same agent resumed and worked normally.
+
+**Lesson repeated three times today: measure before concluding, and prefer a second, differently
+constructed measurement.** Stale `Get-ChildItem` metadata, `Get-PSDrive … .Free` returning `$null`,
+`Get-NetTCPConnection` silently returning nothing without elevation, and a concatenated source's
+virtual line numbers have each produced a confident wrong conclusion in this session.

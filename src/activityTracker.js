@@ -18,7 +18,10 @@
  *    longer loud run and smear the duty cycle.
  *  - Both tracks feed ONE tracker: the guard asks "is this meeting still going",
  *    not "which track is talking". In the measured recording every beep landed on
- *    the system track only because the user was on headphones.
+ *    the system track only because the user was on headphones — which is exactly
+ *    why the loud time is a UNION of wall-clock coverage and never a sum: with a
+ *    sum the same beep heard on speakers counted twice (2.5 s -> 5.0 s) and
+ *    defeated the 4 s requirement. See loudMsIn() for the measured numbers.
  *
  * Kept free of Electron and timers, in the style of src/lifecyclePolicy.js, so
  * the rule can be unit-tested under plain node. main.js feeds LEVEL samples here;
@@ -46,6 +49,9 @@ function positive(v, dflt) {
  *   stats: (atMs:number) => {windowSec:number, loudSec:number, loudMsInWindow:number, samplesInWindow:number, active:boolean},
  *   reset: () => void,
  * }}
+ * `loudMsInWindow` is wall-clock loud COVERAGE (a union), so it can never exceed
+ * windowSec*1000 — but it is NOT simply (loud samples * sampleSec) once two
+ * tracks' sample boundaries disagree by a partial offset.
  */
 function createActivityTracker(opts) {
   const o = opts || {};
@@ -88,13 +94,52 @@ function createActivityTracker(opts) {
     while (buf.length > maxSamples) buf.shift();
   }
 
-  /** Loud time inside [at - windowMs, at]. Samples from the future (a clock that
-   *  jumped backwards) are ignored rather than counted. */
+  /** Wall-clock LOUD COVERAGE inside [at - windowMs, at] — the measure of the
+   *  UNION of the loud samples' intervals, each sample covering
+   *  [s.at - sampleMs, s.at] — not the sum of their durations.
+   *
+   *  Why measure-of-union instead of a sum (measured 2026-09-15 on meeting
+   *  2026-09-15_083734, see BACKLOG §11.3): this tracker is fed by BOTH tracks
+   *  on purpose ("is this meeting still going?", not "which track is talking"),
+   *  and with a sum a sound that reaches both tracks is counted TWICE. The
+   *  2.5 s notification chime of that recording contributed 2.5 s while the user
+   *  was on headphones (system track only -> 2500 ms against the 4000 ms
+   *  requirement -> correctly rejected), but the SAME chime on speakers reaches
+   *  mic as well and contributes 2.5 + 2.5 = 5000 ms >= 4000 ms -> the silence
+   *  clock resets and the auto-stop slides 5 minutes. The margin halved exactly
+   *  when the user was not on headphones.
+   *
+   *  A union can never count the same instant twice, whatever the offsets are:
+   *  two observations of one instant overlap by construction, and where two
+   *  tracks' sample boundaries genuinely disagree the offset shows up as real
+   *  extra cover (that is honest visible time, not double-counting).
+   *
+   *  Two clips: a sample that reaches back before `at - windowMs` is clipped to
+   *  the window (it may only contribute the part of itself inside it), and a
+   *  sample that reaches past `at` (a clock that jumped backwards) contributes
+   *  only up to `at`, which also keeps the interval non-empty. Samples from the
+   *  future are therefore still ignored rather than counted — and because their
+   *  intervals are empty they cannot even merge two interval groups together. */
   function loudMsIn(at) {
+    const from = at - windowMs;
+    /* Sweep the chronologically ordered loud intervals, accumulating the UNION
+     * length. buf is kept chronological by insert(); a sample whose interval
+     * lies entirely before `from` simply ends up below `cursor` and adds
+     * nothing. */
     let ms = 0;
+    let cursor = -Infinity; // right edge of the coverage accumulated so far
     for (const s of buf) {
-      const age = at - s.at;
-      if (s.loud && age >= 0 && age <= windowMs) ms += sampleMs;
+      if (!s.loud) continue;
+      const start = Math.max(s.at - sampleMs, from);
+      const end = Math.min(s.at, at);
+      if (end <= start) continue; // future sample, or clipped to nothing
+      if (start >= cursor) {
+        ms += end - start; // disjoint: a new covered interval
+        cursor = end;
+      } else if (end > cursor) {
+        ms += end - cursor; // overlapping: only the uncovered tail is new
+        cursor = end;
+      }
     }
     return ms;
   }

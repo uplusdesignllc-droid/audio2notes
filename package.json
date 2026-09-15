@@ -1,10 +1,11 @@
 {
   "name": "audio-to-notes",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Audio2Notes — record meetings (system audio + mic) and auto-generate notes, independent of meeting apps.",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
+    "test": "node test/run.js",
     "prepackage": "node -e \"if(!require('fs').existsSync('.cap/capture.exe')){console.error('\\n缺少 .cap/capture.exe —— 请先运行: npm run capture:build （需要 msys2 gcc）\\n');process.exit(1)}\"",
     "package": "electron-builder --win portable",
     "capture:build": "gcc -O2 -Wall -DINITGUID -o .cap/capture.exe .cap/capture.c -lole32 -luuid -lpropsys"

@@ -289,9 +289,18 @@ function auditMeeting(rootDir, name, since) {
   }
 
   // ---- check 10: leftover .tmp / .probe-* --------------------------------
+  /* A `.tmp` file is part of the DESIGNED archive write: ffmpeg encodes to
+   * `<out>.tmp`, the result is verified, and only then is it renamed over the real
+   * file. So while the archive is running one is *expected* to be present, and this
+   * check used to fire WARN during every healthy archive — observed twice on
+   * 2026-09-15, first on mic.opus.tmp and then on mixed.opus.tmp minutes later.
+   * It therefore gets the same in-flight exemption as the missing-artifact checks
+   * above (see the comment at IN_FLIGHT_MS). A `.tmp` in a STALE directory is still
+   * real evidence of a crashed run, so it stays a WARN there. */
   const tempFiles = files.filter((f) => /\.tmp$/i.test(f) || /\.probe-[^\s]+$/i.test(f));
   if (tempFiles.length > 0) {
-    add('WARN', 'tmp-probe', `leftover temp/progress file(s): ${tempFiles.join(', ')}`);
+    add(inFlight ? 'INFO' : 'WARN', 'tmp-probe',
+      `leftover temp/progress file(s): ${tempFiles.join(', ')}${inFlightNote}`);
   }
 
   // ---- check 11: notes fallback / translation skipped ---------------------

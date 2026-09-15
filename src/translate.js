@@ -1,7 +1,25 @@
 "use strict";
 /* Translation to Simplified Chinese.
  * Engine: ollama (default, local) | openai (OpenAI-compatible).
- * Strategy: numbered-line batching so translations align back to transcript chunks. */
+ * Strategy: numbered-line batching so translations align back to transcript chunks.
+ *
+ * num_ctx: this file used to send NONE, so every translation ran at Ollama's default
+ * context and forced a full model reload on each side of the notes phase (measured
+ * 2026-09-15: the runner that served the notes came up at context_length 8192 and a
+ * second one was started with `-c 65536` — BACKLOG.md §11.4). Both calls below now
+ * use the run's pinned context from src/ctxPin.js, which is declared from the
+ * transcript length before the first request so it also covers the summarizer that
+ * runs after us. */
+
+const ctxPin = require("./ctxPin");
+
+/* translate sees only the raw segment texts, while summarize() sizes its plan from
+ * `meetings.transcriptText(chunks)`, which adds a speaker label per line. Both must
+ * land in the SAME plan regime or the pin would have to grow (one extra reload), so
+ * this count is padded: label overhead measured at well under 25 % of a real
+ * transcript, and the pad only ever moves the estimate into the larger regime.
+ * (GUESS: 25 % is a safety margin, not a measurement.) */
+const TRANSCRIPT_CHARS_PAD = 1.25;
 
 function httpJson(url, body, headers = {}, timeoutMs = 300000) {
   const ctrl = new AbortController();
@@ -23,10 +41,13 @@ async function ollamaTranslate(prompt, cfg) {
     model = (j.models || [])[0]?.name;
     if (!model) throw new Error("Ollama has no models installed");
   }
+  const numPredict = ctxPin.TRANSLATE_NUM_PREDICT;
+  // The run's pinned context, not a per-request choice (see the header).
+  const num_ctx = ctxPin.numCtxFor(cfg, SYSTEM_TRANSLATOR.length + prompt.length, numPredict);
   const res = await httpJson(base + "/api/chat", {
     model,
     stream: false,
-    options: { temperature: 0.1, num_predict: 4096 },
+    options: { temperature: 0.1, num_predict: numPredict, num_ctx },
     messages: [
       { role: "system", content: SYSTEM_TRANSLATOR },
       { role: "user", content: prompt },
@@ -134,6 +155,19 @@ async function translateChunks(chunks, cfg, onBatch) {
   const out = [];
   let i = 0;
   const total = chunks.length;
+  /* Declare the run's num_ctx before the first request. This phase runs BEFORE the
+   * notes, so whichever module gets here first must already size the context for
+   * both — otherwise the summarizer would raise the pin and Ollama would reload the
+   * model mid-run (the exact defect of BACKLOG.md §11.4). Skipped for the openai
+   * engine, which makes no Ollama call at all. */
+  if (cfg.translation.engine !== "openai") {
+    const transcriptChars = chunks.reduce((n, c) => n + String((c && c.text) || "").length, 0);
+    ctxPin.declareRun(cfg, {
+      transcriptChars: Math.ceil(transcriptChars * TRANSCRIPT_CHARS_PAD),
+      numPredictMax: ctxPin.TRANSLATE_NUM_PREDICT,
+      label: "translate",
+    });
+  }
   while (i < total) {
     let chars = 0, j = i;
     while (j < total && chars < BATCH_CHARS) {

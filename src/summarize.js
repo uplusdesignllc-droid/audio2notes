@@ -13,10 +13,18 @@
  * request, per-stage progress, and a LOUD, visible fallback banner if an LLM call
  * fails. The fallback reason is returned to the caller and stored in meta.json. */
 
-const CHUNK_CHARS = 8000;        // ~2 200 tokens per map request
-const MAX_CHUNK_CHARS = 20000;   // hard ceiling for a single request
+const ctxPin = require("./ctxPin");
+
+/* Chunking ceilings. They live in src/ctxPin.js because the run's pinned num_ctx
+ * has to be proved big enough for every request shape these numbers produce — one
+ * source of truth, so the chunker and the context planner cannot drift apart. */
+const CHUNK_CHARS = ctxPin.CHUNK_CHARS;          // 8000: ~2 200 tokens per map request
+const MAX_CHUNK_CHARS = ctxPin.MAX_CHUNK_CHARS;  // 20000: hard ceiling for a single request
 const MAX_MAP_CHUNKS = 80;       // ≈640 000 chars of transcript; beyond this we warn
 const REDUCE_GROUP_CHARS = 24000;
+const MAP_PREDICT_CEIL = 3000;   // largest num_predict the map stage can ask for
+const MAP_PREDICT_MIN = 1200;
+const MERGE_PREDICT = 1600;      // num_predict of every merge call
 
 const LEVEL_PROMPTS = {
   brief: `You convert meeting transcripts into VERY SHORT notes. Be terse.
@@ -112,7 +120,9 @@ function buildSystemPrompt(level) {
 
 /* ---- chunking ----------------------------------------------------------- */
 
-/** Rough token estimate; deliberately conservative (Chinese is denser per char). */
+/** Rough token estimate; deliberately conservative (Chinese is denser per char).
+ *  src/ctxPin.js evaluates the same arithmetic inline when it sizes the run's
+ *  pinned num_ctx — keep the 3.2 divisor and the +512 margin in sync. */
 function estimateTokens(s) {
   return Math.ceil(String(s || "").length / 3.2);
 }
@@ -138,12 +148,10 @@ function splitTranscript(text, chunkChars = CHUNK_CHARS) {
   return chunks.filter((c) => c.trim().length);
 }
 
-/** num_ctx big enough for prompt + answer + margin, rounded to a common size. */
-function ctxFor(promptChars, numPredict) {
-  const need = estimateTokens("x".repeat(promptChars)) + numPredict + 512;
-  for (const c of [4096, 8192, 16384, 32768, 65536, 131072]) if (c >= need) return c;
-  return 131072;
-}
+/** num_ctx big enough for prompt + answer + margin, rounded to a common size.
+ *  Kept here (and re-exported) as the per-request estimator; the RUN's context is
+ *  the pinned maximum computed by src/ctxPin.js — see the note on ollamaChat. */
+const ctxFor = ctxPin.ctxFor;
 
 /* ---- transports --------------------------------------------------------- */
 
@@ -164,9 +172,18 @@ function httpJson(url, body, headers = {}, timeoutMs = 300000) {
  * and a hard prompt can burn the whole num_predict budget thinking, returning an
  * EMPTY content with done_reason=length. That is exactly how a 224-minute meeting
  * lost its final merge call. Thinking is off by default for summarization; set
- * `notes.ollama.think = true` to re-enable it. */
-async function ollamaChat({ base, model, system, user, temperature, numPredict, timeoutMs, think = false }) {
-  const num_ctx = ctxFor((system || "").length + (user || "").length, numPredict);
+ * `notes.ollama.think = true` to re-enable it.
+ *
+ * `ctxForRun` is the run's PINNED context (src/ctxPin.js). Picking a context per
+ * request is what made Ollama reload the 17.3 GB model mid-pipeline (BACKLOG.md
+ * §11.4: context_length 8192 → `-c 65536` between two runners of one run), so the
+ * phase pins one value up front and every call — map, merge, final, translate —
+ * reads it through here. The pin is the maximum ctxFor() over every request shape
+ * the run can produce, so it can never be smaller than a request needs; ctxFor()
+ * is only the fallback for callers with no run (standalone use and tests). */
+async function ollamaChat({ base, model, system, user, temperature, numPredict, timeoutMs, think = false, ctxForRun }) {
+  const promptChars = (system || "").length + (user || "").length;
+  const num_ctx = typeof ctxForRun === "function" ? ctxForRun(promptChars, numPredict) : ctxFor(promptChars, numPredict);
   const t0 = Date.now();
   const res = await httpJson(
     base + "/api/chat",
@@ -262,6 +279,8 @@ function makeCaller(cfg) {
         numPredict: o.numPredict,
         timeoutMs: o.timeoutMs || 600000,
         think: o.think === undefined ? state.think : o.think,
+        // ONE context for the whole run: every call of every stage shares this pin.
+        ctxForRun: (chars, predict) => ctxPin.numCtxFor(cfg, chars, predict),
       });
     return state;
   }
@@ -344,6 +363,20 @@ async function summarize(transcript, cfg, onProgress = () => {}) {
     warnings.push(`转写过长：只处理了前 ${MAX_MAP_CHUNKS} 段（约 ${(MAX_MAP_CHUNKS * CHUNK_CHARS / 1000).toFixed(0)}k 字符），末尾 ${dropped} 段未纳入摘要`);
   }
 
+  /* Pin the run's num_ctx BEFORE the first request. Ollama reloads the entire
+   * model when the served context size changes, and this phase also gets calls from
+   * translate.js (transcript batches before us, the notes translation after us), so
+   * the pin is declared from the transcript length and shared through cfg —
+   * `cfg.translation`'s calls land on the same number instead of forcing their own
+   * reload. See src/ctxPin.js for why the pinned value cannot be too small. */
+  if (provider === "ollama") {
+    ctxPin.declareRun(cfg, {
+      transcriptChars: transcript.length,
+      numPredictMax: Math.max(opt.num_predict, MAP_PREDICT_CEIL, MERGE_PREDICT),
+      label: "notes",
+    });
+  }
+
   const caller = makeCaller(cfg);
   // With no explicit model configured, pick one from Ollama (never a vision model).
   if (caller.name === "ollama" && !caller.model) {
@@ -410,7 +443,7 @@ async function summarize(transcript, cfg, onProgress = () => {}) {
         const sys = MAP_PROMPT.replace("{i}", String(i + 1)).replace("{n}", String(chunks.length));
         // Scale the extract budget with the part's size: a flat 1500 was hit by
         // 7 of 10 parts of a 224-minute meeting, which silently thinned the notes.
-        const mapPredict = Math.min(3000, Math.max(1200, Math.round(chunks[i].length / 3)));
+        const mapPredict = Math.min(MAP_PREDICT_CEIL, Math.max(MAP_PREDICT_MIN, Math.round(chunks[i].length / 3)));
         const r = await caller.call(sys, "TRANSCRIPT PART:\n\n" + chunks[i], {
           temperature: 0.2,
           numPredict: mapPredict,
@@ -450,7 +483,7 @@ async function summarize(transcript, cfg, onProgress = () => {}) {
           const r = await caller.call(
             `You merge several sets of meeting notes into one de-duplicated set. Keep every distinct fact, name, number and decision; drop duplicates and merge overlapping bullets. Output the same markdown headings you were given (## Points, ## Decisions, ## Actions, ## Questions, ## Quotes). Same language as the input.`,
             groups[i],
-            { temperature: 0.2, numPredict: 1600 }
+            { temperature: 0.2, numPredict: MERGE_PREDICT }
           );
           merged.push(r.text.trim());
         }
@@ -461,6 +494,9 @@ async function summarize(transcript, cfg, onProgress = () => {}) {
       // final pass: turn the collected extracts into the user's requested format
       onProgress({ phase: "summarizing", message: "整理成最终笔记…", progress: 92 });
       const joined = current.join("\n\n");
+      // This cap is the largest prompt the run can produce; src/ctxPin.js sizes the
+      // pinned num_ctx from it, so keep the multiplier in sync with
+      // ctxPin.FINAL_INPUT_CEIL_CHARS (= MAX_CHUNK_CHARS × FINAL_INPUT_MULTIPLIER).
       const input = joined.length > MAX_CHUNK_CHARS * 4 ? joined.slice(0, MAX_CHUNK_CHARS * 4) : joined;
       if (input.length < joined.length) warnings.push("最终合并阶段输入被截断（仍覆盖会议全部内容的分段提炼结果）");
       const r = await caller.call(
