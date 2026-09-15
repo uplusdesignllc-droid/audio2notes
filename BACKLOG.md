@@ -995,9 +995,13 @@ supplies the hangover logic that `activityTracker.js` hand-rolls from a loudness
 
 Model: `https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx`,
 **643,854 bytes**, SHA-256 `9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6`.
-Silero VAD is MIT-licensed. Shipping it means adding it to `assets/models/` or downloading it on
-demand — the latter reuses the existing voiceprint-model flow (`models.js`) and needs no installer
-change.
+Silero VAD is MIT-licensed. **DECIDED by the owner 2026-09-14: bundle it**, as
+`assets/models/silero_vad.onnx` with `assets/models/LICENSE-silero-vad.txt` alongside. `package.json`
+already lists `assets/**` in `files[]` and `assets/models/**` in `asarUnpack`, so packaging needed no
+change at all and the installer grows by 643 KB against ~148 MB. The argument that decided it: the
+project's stated goal is offline-capable, and a guard whose entire job is "has the meeting ended"
+must not be able to fail because a download did. The on-demand route (reusing the voiceprint-model
+flow in `models.js`) stays available if installer size ever becomes the binding constraint.
 
 ### 10.2 Result on the 2026-09-14 20:33:32 recording (7 known chimes)
 Config `threshold 0.5, minSilenceDuration 0.5, minSpeechDuration 0.25, windowSize 512`,
