@@ -5,6 +5,7 @@ const fs = require("fs");
 
 const config = require("./config");
 const capture = require("./capture");
+const liveVad = require("./liveVad");
 const transcribe = require("./transcribe");
 const summarize = require("./summarize");
 const translate = require("./translate");
@@ -709,6 +710,177 @@ function stopPolling() {
   rec.levelTimers = [];
 }
 
+/* ---- shadow VAD (EXPERIMENT: measurement only, decides nothing) -----------
+ * The loudness meter behind the "is this meeting still going" guard cannot tell a
+ * Windows notification chime from speech. This block runs a real VAD
+ * (src/liveVad.js, silero via the sherpa-onnx-node dependency that is already
+ * installed) alongside the level meter and writes ONE JSON per meeting to
+ * <userData>/vad-shadow/, so the live result can be compared against the offline
+ * experiment in .scratch/vad/ on real recordings.
+ *
+ * INERT BY CONSTRUCTION, and a reviewer should be able to check every claim:
+ *  - it never writes lifecycle.lastLoudAt, never affects rec.busy / the watchdog
+ *    / the silence guard / the size fuse / the disk guard / the pipeline;
+ *  - it sends no IPC ("level", "pipeline") and never calls notifyUser();
+ *  - it writes nothing into the meeting directory (the meeting dir must stay
+ *    free of experiment artifacts);
+ *  - every failure is swallowed: bad model, unreadable WAV, native throw — the
+ *    shadow disables itself and logs, at most once per recording;
+ *  - there is no config key anywhere that turns it into enforcement.
+ * Cost is bounded and small: ~2.5 ms of VAD CPU per second of audio (measured
+ * offline: 24913 blocks / 797 s in 1996 ms) and 32 KB/s read per track. */
+function startVadShadow(dir) {
+  const cfg = config.load();
+  const info = liveVad.modelInfo((cfg.vad && cfg.vad.modelPath) || liveVad.defaultModelPath());
+  if (!info.ok) {
+    // Inert, silently. A hash mismatch is a WARNING rather than a log line
+    // because it means the on-disk model is not the one the offline numbers were
+    // measured with, and nothing about this recording can then be trusted.
+    if (info.exists) console.warn(`[vad-shadow] inert: ${info.reason} (${info.path})`);
+    else console.log(`[vad-shadow] inert: ${info.reason} (${info.path})`);
+    // Clear the shadow state explicitly: `rec` is rebuilt by object spread on
+    // every record:start, so an earlier recording's tracks would otherwise ride
+    // along and could be reported a second time at the next stop.
+    rec.vadTimers = [];
+    rec.vadTracks = null;
+    rec.vadStartedAt = null;
+    rec.vadModel = null;
+    rec.vadMeetingDir = null;
+    return false;
+  }
+  const vcfg = cfg.vad || {};
+  const tracks = {};
+  const timers = [];
+  for (const key of ["system", "mic"]) {
+    const r = rec[key];
+    if (!r) continue;
+    const vad = liveVad.createTrackVad({
+      modelPath: info.path,
+      sampleRate: 16000,
+      threshold: vcfg.threshold,
+      minSilenceDuration: vcfg.minSilenceDuration,
+      minSpeechDuration: vcfg.minSpeechDuration,
+      windowSize: vcfg.windowSize,
+    });
+    const st = { vad, reader: liveVad.createWavTailReader({ wavFile: r.wavFile }), wavFile: r.wavFile, timer: null };
+    /* 1 s poll, the same shape as pollLevels(). The poll interval does NOT set
+     * the analysis granularity — feedS16() slices whatever it is given into
+     * whole 512-sample blocks and calls isDetected() after each one, so the poll
+     * only bounds how far behind the audio clock the VAD can be (at most one
+     * second), never what it decides. */
+    st.timer = setInterval(() => {
+      if (st.vad.isFailed()) {
+        // Failed => permanently inert for THIS recording (liveVad logs the
+        // reason once). The timer is dropped rather than left ticking.
+        if (st.timer) clearInterval(st.timer);
+        st.timer = null;
+        return;
+      }
+      const buf = st.reader.readNew(); // empty Buffer when nothing was appended
+      if (buf.length) st.vad.feedS16(buf);
+    }, 1000);
+    tracks[key] = st;
+    timers.push(st.timer);
+  }
+  rec.vadTimers = timers;
+  rec.vadTracks = tracks;
+  rec.vadStartedAt = Date.now();
+  rec.vadModel = info;
+  // The report's provenance comes from the dir handed in by record:start, not from
+  // rec.dir, so a later change to rec cannot mislabel the file.
+  rec.vadMeetingDir = dir || rec.dir || null;
+  return true;
+}
+
+/**
+ * Stop the shadow VAD and write its report. Called from the same place the
+ * capture processes have already exited, so the WAV data areas are final.
+ * Never throws: a broken shadow must not be able to break a stop.
+ */
+function stopVadShadow() {
+  const tracks = rec.vadTracks || {};
+  for (const t of rec.vadTimers || []) clearInterval(t);
+  rec.vadTimers = [];
+  rec.vadTracks = null;
+  const keys = Object.keys(tracks);
+  if (!keys.length) return null;
+  const startedAt = rec.vadStartedAt || Date.now();
+  const info = rec.vadModel || { path: null, sha256: null, bytes: 0, ok: false };
+  const meetingDir = rec.vadMeetingDir || rec.dir || null;
+  rec.vadModel = null;
+  rec.vadStartedAt = null;
+  rec.vadMeetingDir = null;
+  const now = Date.now();
+  const doc = {
+    version: 1,
+    mode: "shadow",         // measurement, not enforcement
+    enforcement: false,
+    /* Provenance: which recording, which model (path + SHA-256), which exact VAD
+     * config produced these numbers. Without all three the numbers are not
+     * comparable to the offline reference in .scratch/vad/. */
+    meeting: meetingDir ? path.basename(meetingDir) : null,
+    meetingDir,
+    startedAt: new Date(startedAt).toISOString(),
+    stoppedAt: new Date(now).toISOString(),
+    shadowElapsedSec: Math.round((now - startedAt) / 100) / 10,
+    pollIntervalMs: 1000,
+    bufferSizeInSeconds: liveVad.BUFFER_SECONDS,
+    model: {
+      path: info.path, sha256: info.sha256, expectedSha256: liveVad.MODEL_SHA256,
+      bytes: info.bytes, ok: info.ok,
+    },
+    vadConfig: tracks[keys[0]].vad.config,
+    tracks: {},
+  };
+  for (const key of keys) {
+    const st = tracks[key];
+    try {
+      // Drain whatever the last poll did not see (the writer's final flush).
+      const buf = st.reader.readNew();
+      if (buf.length) st.vad.feedS16(buf);
+    } catch (e) { console.warn(`[vad-shadow] final read failed (${key}):`, (e && e.message) || e); }
+    st.vad.close(); // pads the trailing partial block and closes an open run
+    const s = st.vad.stats();
+    /* The VAD was configured for 16 kHz mono s16 and dataOffset 44 WITHOUT
+     * inspecting the audio (both tracks are documented as READY fmt=16000:1:16).
+     * Record what the file actually is, so a wrong assumption shows up in the
+     * report instead of quietly scaling every interval. The stream is already over
+     * by this point, so this only annotates — it cannot change the measurement. */
+    const fmt = liveVad.readWavFormat(st.wavFile);
+    const formatOk = !!fmt && fmt.sampleRate === 16000 && fmt.channels === 1 && fmt.bits === 16 && fmt.dataOffset === 44;
+    if (!formatOk) {
+      console.warn(`[vad-shadow] ${key}: audio format is not the assumed 16000:1:16 @44 — ${JSON.stringify(fmt)}`);
+    }
+    doc.tracks[key] = {
+      intervals: s.intervals,
+      totalSpeechSec: s.totalSpeechSec,
+      audioSec: s.audioSec,
+      speechFraction: s.speechFraction,
+      blocksFed: s.blocksFed,
+      samplesFed: s.samplesFed,
+      bytesFed: s.bytesFed,
+      droppedIntervals: s.droppedIntervals,
+      errors: s.errors,
+      failed: s.failed,
+      wav: st.wavFile,
+      reader: st.reader.stats(),
+      wavFormat: fmt,             // { sampleRate, channels, bits, audioFormat, dataOffset, size }
+      formatMatchesAssumption: formatOk,
+    };
+  }
+  try {
+    const dir = path.join(app.getPath("userData"), "vad-shadow");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${doc.meeting || "recording"}.json`);
+    fs.writeFileSync(file, JSON.stringify(doc, null, 2), "utf8");
+    console.log(`[vad-shadow] wrote ${file}`);
+    return file;
+  } catch (e) {
+    console.warn("[vad-shadow] report not written:", (e && e.message) || e);
+    return null;
+  }
+}
+
 /* ---- transcription of the captured sources ------------------------------- */
 
 /**
@@ -850,6 +1022,9 @@ ipcMain.handle("record:start", async (_e, opts = {}) => {
   rec = { ...rec, ...procs, dir, startTime: Date.now(), limitFired: false, limitReached: null, stopReason: null, captureInfo: null };
   armRecordingGuard(); // fresh activity window + fresh silence clock: nothing leaks from the previous recording
   pollLevels();
+  // Shadow VAD, started the same way pollLevels() is: per track, torn down on
+  // stop. It observes only — its result never reaches `rec`, the guard or the UI.
+  startVadShadow(dir);
   return { ok: true, dir };
 });
 
@@ -905,6 +1080,12 @@ async function stopRecordingAndProcess() {
   /* Stash the per-track capture provenance on `rec` — the process handles are
    * cleared just below, but `rec.captureInfo` survives for the meta object. */
   rec.captureInfo = captureInfo;
+  /* Shadow VAD stops here: both capture processes have exited, so every byte of
+   * both WAV data areas is on disk and the final read sees all of it. Placed
+   * before the pipeline branches so exactly one report is written per meeting on
+   * every stop path (queued, deferred or normal). It cannot throw, and it does
+   * not touch `sources`, `durationSec`, `rec.busy` or the pipeline. */
+  stopVadShadow();
   // Ask for the roster now, at stop (before mixing/transcription) — gated on
   // askOnStop inside. No-op when the setting is off; nothing leaks into meta.
   maybeRequestParticipants();

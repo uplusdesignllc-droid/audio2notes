@@ -6,6 +6,21 @@ const { app } = require("electron");
 const DEFAULTS = {
   meetingsDir: "",            // empty => <userData>/meetings
   capture: { system: true, mic: true },
+  /* Silero VAD, SHADOW ONLY (src/liveVad.js).
+   * This block configures a measurement, not a behaviour: nothing in the guard,
+   * the watchdog, the silence guard, the size fuse or the pipeline reads it, and
+   * there is deliberately no key here that could turn the shadow into
+   * enforcement. The operating point below is the one validated offline in
+   * .scratch/vad/ (threshold 0.75 + >= 1.0 s of continuous speech rejected all 7
+   * known Windows chimes on a real recording, for a 6.6 % loss of real speech;
+   * at the 0.5 default 2 of 7 chimes leaked a 0.67-0.70 s blip). */
+  vad: {
+    modelPath: "",          // empty => bundled assets/models/silero_vad.onnx; missing/mismatched => shadow stays inert
+    threshold: 0.75,        // validated: chimes rejected at >= 0.75
+    minSilenceDuration: 0.5,
+    minSpeechDuration: 1.0, // validated: >= 1.0 s continuous speech rejects all 7 chimes at every threshold 0.3-0.9
+    windowSize: 512,        // Silero's native window at 16 kHz
+  },
   whisper: {
     model: "Xenova/whisper-base.en", // tiny.en/tiny/base.en/base/small.en/small
     cacheDir: "",             // empty => <userData>/models
