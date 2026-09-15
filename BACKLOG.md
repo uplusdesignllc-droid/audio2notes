@@ -978,3 +978,89 @@ The 20:33:32 recording is the acceptance test §8.5 asked for:
 `participantsAskedAt = 2026-09-15T00:46:50.936Z` (exactly the stop instant), `stopReason = "user"`,
 and per-track `capture` provenance with both T0 anchors. Still unverified: the deferred/queued path,
 the speaker-name inputs being prefilled from the roster, and the 「以后停止时不要再问我」 preference.
+
+## 10. VAD feasibility — measured offline (2026-09-14)
+
+The owner's proposal: 「最准确的就是检测人声吧，没有语音了就是会议结束了」 — decide "the meeting is
+over" from *speech*, not from loudness. It was measured before any live code was written, on real
+recordings with a known chime count. **Verdict: it works, with one required rule change.**
+
+### 10.1 The component already ships in an existing dependency
+`sherpa-onnx-node` (already a dependency, used for diarization) exports a `Vad` class from
+`node_modules/sherpa-onnx-node/vad.js`, and `types.js` documents `VadConfig.sileroVad`
+(`model`, `threshold`, `minSilenceDuration`, `minSpeechDuration`, `windowSize`) plus `sampleRate`,
+`numThreads`. Its `isDetected()` is a hysteretic speech/non-speech state machine, i.e. the VAD
+supplies the hangover logic that `activityTracker.js` hand-rolls from a loudness proxy.
+`package.json`'s `asarUnpack` already covers `node_modules/sherpa-onnx-*/**`, so packaging is done.
+
+Model: `https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx`,
+**643,854 bytes**, SHA-256 `9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6`.
+Silero VAD is MIT-licensed. Shipping it means adding it to `assets/models/` or downloading it on
+demand — the latter reuses the existing voiceprint-model flow (`models.js`) and needs no installer
+change.
+
+### 10.2 Result on the 2026-09-14 20:33:32 recording (7 known chimes)
+Config `threshold 0.5, minSilenceDuration 0.5, minSpeechDuration 0.25, windowSize 512`,
+512-sample blocks, 16 kHz. Overlap = how much of the run the VAD called speech.
+
+| system-track run | start (s) | dur | VAD overlap | verdict |
+|---|---|---|---|---|
+| 1 (real audio) | 0.0 | 119.5 | 83.78 s | detected |
+| 2 chime | 242.1 | 2.5 | **0.00** | **rejected** |
+| 3 chime | 348.1 | 2.0 | 0.70 s | leak |
+| 4 chime | 439.1 | 2.0 | **0.00** | **rejected** |
+| 5 chime | 537.1 | 3.0 | **0.00** | **rejected** |
+| 6 chime | 563.1 | 2.5 | **0.00** | **rejected** |
+| 7 chime | 649.1 | 2.0 | 0.67 s | leak |
+| 8 chime | 783.1 | 2.5 | **0.00** | **rejected** |
+
+The **mic track's 6 runs are all real speech and all detected** (0 rejections) — that is the
+failure direction the LEVEL meter has and VAD fixes: a peak meter misses quiet speech, a VAD does not.
+Total detected speech: `203332/system` 85.60 s of 797.19 s (10.7 %), `203332/mic` 63.42 s (8.0 %).
+
+**Control (mandatory, and it passed):** `2026-09-14_094817\system.opus`, a real accepted meeting —
+**746.56 s detected of 1175.78 s (63.5 %), 265 intervals**, precision 96.2 % against PCM-measured
+non-silence, longest intervals 16.4 / 15.5 / 15.1 s. So this is not a null detector.
+
+**Sensitivity (chime leakage vs `threshold`):** 0.3 → 4/7 rejected, 2.18 s leak; **0.5 → 5/7,
+1.37 s**; 0.6 → 6/7, 0.66 s; **0.75 → 7/7, 0.00 s**; 0.9 → 7/7, 0.00 s. Lowering the threshold is
+never better. Going to 0.75 costs 6.6 % of the real test audio (83.78 → 78.22 s).
+
+### 10.3 The rule that matters — and why it changes the shipped design
+A 0.7 s leaked blip would still reset a "any speech resets the clock" guard, so the threshold alone is
+not the answer. Requiring **≥ 1.0 s of *continuous* detected speech** gives **0/7 chimes tripping at
+every threshold from 0.3 to 0.9**, while keeping 82.0 s of the 117 s of real audio (vs 83.8 s at a
+0.5 s requirement); on the control it keeps 700.3 s of 746.6 s. Low cost, robust, not knife-edge.
+
+So the shape is: per-track VAD → `isDetected()` state → activity only once a speech run reaches 1.0 s
+→ the guard counts silence while no track is in speech. That **replaces the 12 s / 4 s duty cycle**
+(`activityTracker.js`), which exists only to approximate this from a loudness signal; keep the duty
+cycle as the fallback for when the model is absent or the download was declined.
+
+### 10.4 A correction to this document's own numbers
+The "chimes are 2.0–3.0 s" figure in §9 came from LEVEL windows, which are **decay-smoothed**
+(`lvl = lvl*0.3 + last*0.7`). Measuring the PCM directly instead reproduced the same 8 runs run-for-run
+but shows the chimes are **1.0–1.4 s of real audio**; LEVEL windows 2.0–3.0 s. Both are true of their
+own domain — the duty cycle consumes LEVEL windows, so §9.3's margin arithmetic stands — but the audio
+fact is 1.0–1.4 s, and the LEVEL meter inflating a 1.2 s transient into 2.5 s of "activity" is itself
+evidence that it is a poor proxy for speech.
+
+### 10.5 Not tested — do not read this section as a working feature
+- **The live streaming path is untested.** This was offline batch analysis: ~400× real time
+  (800 s in 2.0 s, 1176 s in 2.9 s, 1 thread, CPU provider), so CPU is a non-issue, but that is a
+  throughput figure and **not** a live-latency measurement.
+- **Two tracks need two VAD instances** (a VAD is stateful per stream); "is anyone speaking" is the
+  OR of the two. Untested.
+- **Reading a WAV that `capture.exe` is still writing** is unproven here, though its `fopen(path,"wb")`
+  shares for read and the app already `statSync`s those files mid-recording. Partial tail blocks need
+  carrying over between polls.
+- **n = 7 chimes, one recording, one machine, only two LEVEL peaks (27/31).** A louder or more
+  percussive non-speech sound will likely leak the same way; "7/7 rejected" is not a general
+  non-speech guarantee. The control proves it is not a null detector, not that it is a validated
+  classifier (79.5 % recall of non-silence).
+
+### 10.6 ENVIRONMENT TRAP: HTTPS downloads fail under schannel here
+`Invoke-WebRequest` **and** `curl.exe` both fail in this sandbox with
+`curl: (35) schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030e)`, with no
+proxy configured. The model was fetched successfully through **Node's own TLS stack** instead. Any
+future download here must go through Node, not schannel.
