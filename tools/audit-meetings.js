@@ -258,24 +258,36 @@ function auditMeeting(rootDir, name, since) {
   if (meta && meta.stopReason != null) add('INFO', 'stop-reason', `meta.stopReason = "${meta.stopReason}"`);
 
   // ---- check 8: effective bitrate ----------------------------------------
+  /* Per TRACK. This check used to add every non-mixed .opus file together and then
+   * compare that TOTAL against the per-track preset, which is dimensionally wrong:
+   * two parallel tracks each encoded at ~32 kbps sum to ~64 kbps, so any recording
+   * where both tracks carry real audio measured about twice the preset and warned.
+   * Measured 2026-09-15_104952 (39.27 s): mic 118 434 B + system 158 579 B =
+   * 277 013 B -> 56.4 kbps vs a 32 kbps preset, "+76%".
+   * It stayed hidden for days because the earlier meetings were almost entirely
+   * silent: VBR collapsed each track well below the preset, so the sum happened to
+   * land near it. The severity ORDER is left exactly as it was (ratio < 0.5 -> INFO
+   * because VBR legitimately collapses on silent material, otherwise > 35 % deviation
+   * -> WARN); whether those two branches are ordered sensibly is a separate open
+   * question recorded in BACKLOG §9.5. */
   if (meta &&
       typeof meta.durationSec === 'number' && meta.durationSec > 0 &&
       meta.audio && typeof meta.audio.bitrateKbps === 'number' && meta.audio.bitrateKbps > 0 &&
       Array.isArray(meta.audio.files)) {
-    const perTrack = meta.audio.files.filter(
-      (f) => f && typeof f.to === 'string' && /\.opus$/i.test(f.to) && !/mixed\.opus$/i.test(f.to)
-    );
-    let opusBytes = 0;
-    for (const f of perTrack) if (typeof f.after === 'number') opusBytes += f.after;
-    if (opusBytes > 0) {
-      const effectiveKbps = (opusBytes * 8) / meta.durationSec / 1000;
-      const preset = meta.audio.bitrateKbps;
-      const ratio = effectiveKbps / preset;
-      if (ratio < 0.5) {
-        add('INFO', 'effective-bitrate', `effective ${effectiveKbps.toFixed(1)} kbps vs preset ${preset} kbps (<50% — VBR legitimately drops on silent material)`);
-      } else if (Math.abs(ratio - 1) > 0.35) {
-        add('WARN', 'effective-bitrate', `effective ${effectiveKbps.toFixed(1)} kbps deviates from preset ${preset} kbps by ${(Math.abs(ratio - 1) * 100).toFixed(0)}% (>35%)`);
-      }
+    const preset = meta.audio.bitrateKbps;
+    const measured = meta.audio.files
+      .filter((f) => f && typeof f.to === 'string' && /\.opus$/i.test(f.to) &&
+        !/mixed\.opus$/i.test(f.to) && typeof f.after === 'number')
+      .map((f) => ({ name: f.to, kbps: (f.after * 8) / meta.durationSec / 1000 }));
+    const fmt = (t) => `${t.name} ${t.kbps.toFixed(1)} kbps`;
+    const deviating = measured.filter((t) => Math.abs(t.kbps / preset - 1) > 0.35);
+    const collapsed = deviating.filter((t) => t.kbps / preset < 0.5);
+    const suspicious = deviating.filter((t) => t.kbps / preset >= 0.5);
+    if (suspicious.length) {
+      add('WARN', 'effective-bitrate', `${suspicious.map(fmt).join(', ')} deviates from preset ${preset} kbps by more than 35% (per-track)`);
+    }
+    if (collapsed.length) {
+      add('INFO', 'effective-bitrate', `${collapsed.map(fmt).join(', ')} vs preset ${preset} kbps (<50% — VBR legitimately drops on silent material)`);
     }
   }
 
