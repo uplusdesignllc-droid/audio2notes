@@ -1109,3 +1109,80 @@ a two-tone "ding-dong" chime of 1.5–2 s would cross.
 almost entirely by the system track. The shadow-mode data from several real meetings is what should fix
 the bar properly — and §10.7's question ("does the rule ever declare a live meeting over?") is how to
 judge it, not the kept-speech total.
+
+## 11. Acceptance on the first auto-stopped recording (2026-09-15 08:37:34)
+
+629.2 s recorded. **The guard stopped it by itself at 08:48:04, and the chime test the owner asked for
+did not break it.** This one recording closed several items that had only ever been verified statically,
+and exposed three new defects.
+
+### 11.1 What it confirmed — first time in a real run
+| claim | evidence |
+|---|---|
+| `meta.stopReason` records the real mechanism | **`stopReason = "silence"`** — the first non-`user` / non-`max-duration` value ever written. Which mechanism stopped a recording is now a matter of record instead of an inference from timings. |
+| The P6 roster modal works | `participants = ["sara","tom"]`, `participantsSource = "answered"` (second real run, after `["mike"]`) |
+| The modal is responsive again (Fix 1) | requested at 08:48:04, `mixed.wav` written 08:48:53 — the owner answered inside that window, and the transcription CPU burn began only after it. **The machine was idle while they typed.** This was the part previously marked "never executed". |
+| The banner counts down (Fix A) | owner observed it live; the old build froze at 297 s forever |
+| The shadow VAD's live path is real | `formatMatchesAssumption = true` on both tracks, `wavFormat.dataOffset = 44`, and `reader.bytesRead == FINISHED bytes` **exactly** (20,135,050 and 20,120,814 — not approximately) |
+| The VAD rejects a chime independently | the same 2.5 s chime gave **0.000 s** of speech overlap |
+
+### 11.2 The chime did not break the auto-stop — mechanism, not just outcome
+Real activity ended at **321.5 s**; a lone **2.5 s chime at 610.0–612.5 s (peak 27)**; stop at
+**629.2 s**. Replaying the shipped rule (`.scratch/guard-sim.js`: `LEVEL >= 8`, ≥ 4 s of loud sample-time
+in a 12 s window, both tracks sharing one counter) recognises four activity spans, the last ending at
+**329.5 s** — the span runs ~8 s past the last loud sample because the window still holds ≥ 4 s of loud.
+Predicted stop = 329.5 + 300 = 629.5 s, next 15 s tick = 630.0 s; **actual 629.2 s, within 1 s.**
+
+The chime produced **no activity span at all**: 2.5 s contributed against a 4 s requirement → rejected
+with 1.6× margin. Under the OLD single-sample rule `pollLevels` would have set `lastLoudAt` on it and
+pushed the stop to ~912.5 s (5 more minutes) — and if chimes kept arriving, never.
+
+### 11.3 NEW DEFECT — the shared counter double-counts simultaneous loudness
+`activityTracker.loudMsIn()` adds `sampleSec*1000` for **every** loud sample, and BOTH tracks feed one
+tracker, so a sound present on both tracks at once is counted **twice**: 2 s of wall-clock noise
+satisfies a 4 s requirement.
+
+- On headphones (this test) the chime reached the system track only → 2.5 s → **rejected** ✓
+- On speakers the same chime reaches both → **5.0 s ≥ 4 s → the clock resets** and the stop slides by
+  5 minutes. **The margin halves exactly when the user is not on headphones.**
+
+Fix direction, safe because it only makes the rule stricter: count **0.5 s time-bucket coverage** (a
+bucket is loud if *either* track is loud) instead of summing per-track samples. A single-track chime is
+unaffected (2.5 s → 2.5 s), a double-track chime drops from 5.0 s to 2.5 s, and real speech is unaffected
+because it is long. **Not yet measured** — this recording contains no double-track chime, so proving the
+benefit needs a deliberate test on speakers.
+
+### 11.4 NEW DEFECT — changing `num_ctx` forces a full 17.3 GB model reload
+`ctxFor()` (`src/summarize.js:142-146`) picks a context per request from
+`[4096, 8192, 16384, 32768, 65536, 131072]`, and **Ollama reloads the whole model whenever the context
+size changes**. Observed live in `%LOCALAPPDATA%\Ollama\server.log`:
+
+```
+08:50:31  first runner up          -> /api/ps reported context_length = 8192
+08:53:18  "starting llama-server"  -> ... -c 65536 ... --flash-attn on     (a full unload + reload)
+```
+
+The pipeline took **08:48:04 → 08:56:59 (~9 min)** for a 629 s recording, against ~2 min for the 797 s
+recording the day before — consistent with that reload, made worse by doing it on battery in Windows
+power-saving (the same log shows `llama-server GPU discovery watchdog timed out` twice and `could not
+determine compute capability for CUDA device`).
+
+Fix direction: **pin one `num_ctx` for the whole notes run** (compute the maximum needed once and reuse
+it) instead of letting each translate / map / reduce call choose its own step.
+
+### 11.5 NEW GAP — the audit's `tmp-probe` fires during a healthy archive
+`node tools/audit-meetings.js` reported
+`WARN tmp-probe: leftover temp/progress file(s): mic.opus.tmp` while the archive was legitimately
+mid-flight: `mic.opus.tmp` was 0 bytes and `meta.audio` was still empty, because `writeArtifacts()`
+(`main.js:1198`) runs before the archive step and the `<out>.tmp` file is part of the designed atomic
+write. It fired a **second time** minutes later on `mixed.opus.tmp`, on the next file in the same
+archive — so it is not a one-off.
+
+The audit already exempts *missing* artifacts while the directory was modified in the last 20 min
+(in-flight detection) — **`tmp-probe` does not get that exemption**, so it emits a false WARN during
+every archive. A false warning in the acceptance instrument is a net loss: it teaches the reader to
+skim.
+
+Also noted, not new: `translationSkipped = "transcript-disabled"`, 2 noise-only chunks
+(`"[ Silence ]"`, `"[ ] [BLANK_AUDIO]"` — see the noise-chunk cleanup item), and the 4 leftover
+`.status`/`.stop` files (P4-4).
