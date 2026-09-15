@@ -45,6 +45,16 @@ function add(queue, job) {
      * field not listed is silently dropped — which is exactly how the deferred
      * path lost the metadata the live pipeline records. */
     captureInfo: job.captureInfo || null,
+    /* Roster resolved at stop. Same load-bearing rule as captureInfo above: `add`
+     * rebuilds the job from these named fields, so any field not listed here is
+     * silently dropped. The `|| null` / Array.isArray fallbacks mean a pre-existing
+     * queue.json written before this field existed still loads and nextJob() still
+     * returns it — it falls back to absent, never throws. */
+    // Collapse an empty roster to null across all three (a job must never carry a
+    // source without names); the meta builder then omits the keys entirely.
+    participants: (Array.isArray(job.participants) && job.participants.length) ? job.participants : null,
+    participantsSource: (Array.isArray(job.participants) && job.participants.length) ? (job.participantsSource || null) : null,
+    participantsAskedAt: (Array.isArray(job.participants) && job.participants.length) ? (job.participantsAskedAt || null) : null,
     attempts: job.attempts || 0,
     lastError: job.lastError || null,
   });

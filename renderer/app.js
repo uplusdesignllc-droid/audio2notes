@@ -7,6 +7,7 @@ let timerInt = null;
 let t0 = 0;
 let currentDir = null;
 let lastResult = null; // { notes, notesZh, chunks }
+let meetingParticipants = []; // roster of the open meeting — rename suggestions only (diarization order != roster order, never auto-assign)
 
 /* ---- tabs ---- */
 for (const id of ["record", "import", "history", "models", "settings"]) {
@@ -137,7 +138,7 @@ async function loadConfig() {
   $("cfg-confirm-busy").checked = lc.confirmWhileBusy !== false;
   $("cfg-autostop").checked = as.enabled !== false;
   $("cfg-silence-min").value = typeof as.silenceMin === "number" ? as.silenceMin : 2;
-  $("cfg-forcestop-min").value = typeof as.forceStopAfterMin === "number" ? as.forceStopAfterMin : 5;
+  $("cfg-forcestop-min").value = typeof as.forceStopAfterMin === "number" ? as.forceStopAfterMin : 3;
   $("cfg-mindisk-gb").value = typeof as.minFreeDiskGB === "number" ? as.minFreeDiskGB : 2;
 
   const md = lc.meetingDetect || {};
@@ -212,7 +213,7 @@ $("btn-save").addEventListener("click", async () => {
       autoStop: {
         enabled: $("cfg-autostop").checked,
         silenceMin: Number($("cfg-silence-min").value) || 2,
-        forceStopAfterMin: Number($("cfg-forcestop-min").value) || 5,
+        forceStopAfterMin: Number($("cfg-forcestop-min").value) || 3,
         minFreeDiskGB: Number($("cfg-mindisk-gb").value) || 0,
       },
       meetingDetect: {
@@ -396,7 +397,7 @@ async function stopAndProcess(reason) {
     : "Stopping…";
   $("pipeline").textContent = "Finalizing recording…";
   hideLifecycleBanner();
-  const res = await window.a2n.stopRecord();
+  const res = await window.a2n.stopRecord(reason); // forward the stop reason verbatim (main maps anything unrecognized itself)
   clearInterval(timerInt);
   recording = false;
   $("btn-record").disabled = false;
@@ -429,10 +430,23 @@ async function stopAndProcess(reason) {
 
 $("btn-stop").addEventListener("click", () => stopAndProcess("manual"));
 
-/* ---- lifecycle: silence warning, auto-stop, low disk -------------------- */
+/* ---- lifecycle: silence warning, auto-stop, low disk --------------------
+ * The banner is NEVER hidden when the silence ends: the 「继续录音」 button lives
+ * inside it, so hiding it would take away the user's ONLY way to cancel a pending
+ * auto-stop. It stays visible once shown and only its TEXT changes state:
+ *   silence warning -> counted-down "Y 秒后将自动停止…"
+ *   silence cleared -> "声音已恢复，仍在监控。"
+ *   keep-alive      -> "已取消本次自动停止，直到再次长时间无声。"
+ * The warning text used to be a frozen snapshot ("N 秒后" that never moved,
+ * because main only re-pushed on a NEW warning and any sound reset silentSec to
+ * 0), so the countdown is recomputed once a second from an absolute deadline. */
+let bannerTimer = null;   // the 1 s countdown ticker (never more than one)
+let bannerDeadline = 0;   // epoch ms at which main will force-stop
+
 function hideLifecycleBanner() {
   const b = $("lifecycle-banner");
   if (b) b.hidden = true;
+  stopSilenceCountdown(); // no leaked interval once the banner is gone
 }
 
 function showLifecycleBanner(text) {
@@ -442,17 +456,45 @@ function showLifecycleBanner(text) {
   b.hidden = false;
 }
 
+function stopSilenceCountdown() {
+  if (bannerTimer) {
+    clearInterval(bannerTimer);
+    bannerTimer = null;
+  }
+}
+
+/** Paint the silence warning; `forceInSec` is re-synced on EVERY push from main
+ *  (every 15 s while the silence continues), so the deadline can never sit
+ *  stale for the rest of the recording. */
+function showSilenceCountdown(silentSec, forceInSec) {
+  const b = $("lifecycle-banner");
+  if (!b) return;
+  const mins = Math.floor((Number(silentSec) || 0) / 60);
+  bannerDeadline = Date.now() + (Number(forceInSec) || 0) * 1000;
+  const paint = () => {
+    const left = Math.max(0, Math.round((bannerDeadline - Date.now()) / 1000));
+    $("lifecycle-text").textContent =
+      `已 ${mins} 分钟没有声音。${left} 秒后将自动停止并生成笔记（录音仍在继续）。`;
+  };
+  b.hidden = false;
+  paint();
+  stopSilenceCountdown(); // one ticker only
+  bannerTimer = setInterval(paint, 1000);
+}
+
 if (window.a2n.onLifecycle) {
   window.a2n.onLifecycle((e) => {
     if (!e) return;
     if (e.type === "silence-warning") {
-      const m = Math.floor(e.silentSec / 60);
-      showLifecycleBanner(
-        `已 ${m} 分钟没有声音。${e.forceInSec} 秒后将自动停止并生成笔记（录音仍在继续）。`
-      );
+      showSilenceCountdown(e.silentSec, e.forceInSec);
+    } else if (e.type === "silence-cleared") {
+      // keep the banner (and its keep-alive button), drop only the countdown
+      stopSilenceCountdown();
+      showLifecycleBanner("声音已恢复，仍在监控。");
     } else if (e.type === "auto-stop-request" || e.type === "stop-request") {
       if (recording) stopAndProcess(e.reason);
     } else if (e.type === "disk-low") {
+      stopSilenceCountdown();
       showLifecycleBanner(`磁盘剩余 ${e.freeGB.toFixed(1)} GB（低于 ${e.limitGB} GB），已停止录音以免写满。`);
     }
   });
@@ -462,7 +504,9 @@ const keepAliveBtn = $("btn-keepalive");
 if (keepAliveBtn) {
   keepAliveBtn.addEventListener("click", async () => {
     await window.a2n.lifecycleKeepAlive();
-    hideLifecycleBanner();
+    // do NOT hide the banner here: the button the user just pressed is inside it
+    stopSilenceCountdown();
+    showLifecycleBanner("已取消本次自动停止，直到再次长时间无声。");
     $("record-status").textContent = "继续录音（已取消自动停止，直到再次长时间无声）。";
   });
 }
@@ -573,6 +617,8 @@ async function openMeeting(dir) {
     provider: r.provider || "",
     notesFallbackReason: r.notesFallbackReason || null,
   });
+  // this meeting's roster becomes the name suggestions in the 发言人 rename inputs
+  meetingParticipants = r.participants || [];
   $("tab-record").click();
   $("record-status").textContent = "已打开历史会议：" + dir;
   $("history-status").textContent = "已打开：" + dir;
@@ -655,7 +701,7 @@ async function loadModels() {
     box.appendChild(modelRow(w.label, state, [use, act]));
   }
 
-  const sbox = $("speaker-rows");
+  const sbox = $("speaker-model-rows"); // this is the 模型与接口 card — its old duplicated id was the first match of the meeting panel's
   sbox.innerHTML = "";
   const vp = st.voiceprint;
   const vBusy = modelBusy && modelBusy.kind === "voiceprint";
@@ -934,9 +980,172 @@ if (window.a2n.onQueue) {
   });
 }
 
+/* ---- participants modal --------------------------------------------------
+   Shown at the moment the roster is actually needed (recording stop / re-editing
+   an existing meeting). Deliberately no "cancel" — a recording must not silently
+   lose its roster, so the only outcomes are "save these names" or "keep what we have". */
+let participantsPending = null; // the participants event while the modal is open
+let participantsBusy = false;   // idempotency guard: a double-click must not send two answers
+const pRows = $("participants-rows");
+
+/* Idle button labels, captured once at load. An in-flight submit swaps its own
+ * label to 「保存中…」: under CPU starvation the IPC round-trip takes long enough
+ * that a merely dimmed button reads as "my click did nothing" — and the user then
+ * clicks again. Restored on open AND on close, so a cancelled or timed-out submit
+ * can never leave the pending label stuck on screen. */
+const SAVE_IDLE_LABEL = $("participants-save").textContent;
+const UNCHANGED_IDLE_LABEL = $("participants-unchanged").textContent;
+const SAVE_PENDING_LABEL = "保存中…";
+
+function resetParticipantsButtons() {
+  const save = $("participants-save");
+  const keep = $("participants-unchanged");
+  save.disabled = false;
+  keep.disabled = false;
+  save.textContent = SAVE_IDLE_LABEL;
+  keep.textContent = UNCHANGED_IDLE_LABEL;
+}
+
+function participantRow(name) {
+  const row = document.createElement("div");
+  row.className = "participant-row";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.placeholder = "参会人名字…";
+  input.value = name || "";
+  // Enter on a row must not blur/commit just that row — the modal's keydown
+  // handler turns Enter into "save the whole roster"
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") e.preventDefault(); });
+  const rm = document.createElement("button");
+  rm.className = "ghost";
+  rm.textContent = "移除";
+  rm.title = "移除这一位";
+  rm.addEventListener("click", () => row.remove());
+  row.append(input, rm);
+  return row;
+}
+
+function seedParticipantRows(names) {
+  pRows.innerHTML = "";
+  const list = (names || []).filter((n) => typeof n === "string" && n.trim());
+  (list.length ? list : [""]).forEach((n) => pRows.appendChild(participantRow(n)));
+}
+
+function openParticipantsModal(e) {
+  // an event while the modal is already open: take over its id and re-seed the
+  // rows instead of stacking a second modal on top
+  participantsPending = e;
+  participantsBusy = false;
+  $("participants-title").textContent = e.title || "参会人";
+  $("participants-note").textContent =
+    e.reason === "manual"
+      ? "重新编辑这场会议已保存的参会人名单。"
+      : "这些名字会和这场会议的笔记一起保存（笔记里的「你 / 远端」会变成具体人名）。";
+  $("participants-noask").checked = false;
+  seedParticipantRows(e.prefill);
+  $("participants-overlay").hidden = false;
+  resetParticipantsButtons();
+  const first = pRows.querySelector("input");
+  if (first) first.focus();
+}
+
+function closeParticipantsModal() {
+  participantsPending = null;
+  participantsBusy = false;
+  $("participants-overlay").hidden = true;
+  $("participants-noask").checked = false;
+  // also restores the 「保存中…」 label: no submit path may leave it behind
+  resetParticipantsButtons();
+}
+
+function readParticipantNames() {
+  // main already bounds and sanitises — just trim and drop the empty rows
+  return [...pRows.querySelectorAll("input")].map((i) => i.value.trim()).filter(Boolean);
+}
+
+async function participantsSubmit(unchanged) {
+  if (participantsBusy) return; // second click of the same action is a no-op
+  participantsBusy = true;
+  // Freeze BOTH buttons and say so on the one that was pressed: a merely dimmed
+  // button reads as "my click did nothing" while the machine is busy, and the
+  // natural reaction is to click again.
+  const acted = unchanged ? $("participants-unchanged") : $("participants-save");
+  $("participants-save").disabled = true;
+  $("participants-unchanged").disabled = true;
+  acted.textContent = SAVE_PENDING_LABEL; // restored by closeParticipantsModal()
+
+  const e = participantsPending;
+  let answeredOk = false;
+  if (e && window.a2n.participantsAnswer) {
+    const payload = unchanged
+      ? { id: e.id, unchanged: true }
+      : { id: e.id, names: readParticipantNames() };
+    try {
+      const res = await window.a2n.participantsAnswer(payload);
+      answeredOk = !!(res && res.ok);
+    } catch (err) {
+      console.error("participantsAnswer IPC failed:", err);
+    }
+  }
+  // "don't ask me again" is best-effort: its failure must never block the answer
+  // above from being sent, nor keep the modal open
+  if ($("participants-noask").checked && window.a2n.setConfig) {
+    try {
+      await window.a2n.setConfig({ participants: { askOnStop: false } });
+    } catch (err) {
+      console.error("setConfig(askOnStop) failed:", err);
+    }
+  }
+  closeParticipantsModal();
+  if (!answeredOk) {
+    // the server may have timed out this request — still close, but be loud
+    $("record-status").textContent = "名单没有保存：这次询问已经超时。稍后停止录音时如果还需要名单，会再问你。";
+  }
+}
+
+if (window.a2n.onParticipants) {
+  window.a2n.onParticipants((e) => {
+    if (!e) return;
+    openParticipantsModal(e);
+  });
+}
+
+// Enter = save; Escape = 「不需要更改参会人」(NOT a cancel — a recording must not
+// silently lose its roster). A focused button keeps its own Enter/click.
+$("participants-overlay").addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") {
+    ev.preventDefault();
+    participantsSubmit(true);
+  } else if (ev.key === "Enter" && ev.target.tagName !== "BUTTON") {
+    ev.preventDefault();
+    participantsSubmit(false);
+  }
+});
+$("participants-save").addEventListener("click", () => participantsSubmit(false));
+$("participants-unchanged").addEventListener("click", () => participantsSubmit(true));
+$("participants-add").addEventListener("click", () => {
+  const row = participantRow("");
+  pRows.appendChild(row);
+  // Make the new row unmistakable. Under CPU starvation the paint can lag for
+  // seconds, so an unacknowledged click invites a second (and third) click — each
+  // one appending another empty row, which then looked like the button was
+  // duplicated rather than registered. The flash + scrollIntoView are that
+  // acknowledgement, and both are purely presentational.
+  row.classList.add("participant-row-new");
+  // animationend is the normal path; the timer is the belt for when the animation
+  // never runs at all (prefers-reduced-motion, or a hidden overlay at append time).
+  row.addEventListener("animationend", () => row.classList.remove("participant-row-new"), { once: true });
+  setTimeout(() => row.classList.remove("participant-row-new"), 1200);
+  row.querySelector("input").focus();
+  // after focus(), so the row is on screen even if the focus scroll did nothing
+  row.scrollIntoView({ block: "nearest" });
+});
+
 /* ---- results: notes + chunked transcript + translation toggles ---------- */
 function showResult(res) {
   $("result-card").hidden = false;
+  // a fresh recording has no roster yet; openMeeting() re-fills it from its own meetingsOpen call
+  meetingParticipants = res.participants || [];
   lastResult = { notes: res.notes, notesZh: res.notesZh || null, chunks: res.chunks || [] };
   $("notes-provider").textContent = res.provider || "";
   $("detail-level").value = cfg && cfg.notes.detailLevel || "standard";
@@ -986,6 +1195,19 @@ function renderSpeakerRows() {
       '<div class="hint">还没有识别发言人——点「识别发言人」按声音把他们分开（本地运行，首次会下载 27 MB 声纹模型）。</div>';
     return;
   }
+  // the meeting's roster is a <datalist> suggestion only — diarization order is not
+  // roster order, so we never guess which speaker is which person
+  if (meetingParticipants.length) {
+    const list = document.createElement("datalist");
+    list.id = "speaker-name-suggest";
+    for (const p of meetingParticipants) {
+      const opt = document.createElement("option");
+      opt.value = p;
+      list.appendChild(opt);
+    }
+    box.appendChild(list);
+  }
+
   for (const s of speakers) {
     const row = document.createElement("div");
     row.className = "speaker-row";
@@ -1009,6 +1231,7 @@ function renderSpeakerRows() {
     input.className = "spk-name";
     input.placeholder = "填名字…";
     input.value = s.name || "";
+    if (meetingParticipants.length) input.list = "speaker-name-suggest"; // suggestions only
     const commit = async () => {
       const v = input.value.trim();
       if (v === (s.name || "")) return;
@@ -1026,6 +1249,7 @@ function renderSpeakerRows() {
         try {
           const m = await window.a2n.meetingsOpen({ dir: currentDir });
           if (m && !m.error && m.notes) {
+            if (Array.isArray(m.participants)) meetingParticipants = m.participants;
             lastResult.notes = m.notes;
             lastResult.notesZh = m.notesZh || null;
             updateNotes();

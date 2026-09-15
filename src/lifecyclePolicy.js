@@ -26,7 +26,7 @@ function evaluate(state, cfg, now) {
   );
   const as = (cfg && cfg.autoStop) || {};
   const silenceMin = typeof as.silenceMin === "number" ? as.silenceMin : 2;
-  const forceStopAfterMin = typeof as.forceStopAfterMin === "number" ? as.forceStopAfterMin : 5;
+  const forceStopAfterMin = typeof as.forceStopAfterMin === "number" ? as.forceStopAfterMin : 3;
   const minFreeDiskGB = typeof as.minFreeDiskGB === "number" ? as.minFreeDiskGB : 2;
   const maxElapsedMin = typeof as.maxElapsedMin === "number" ? as.maxElapsedMin : 480;
   const autoStopEnabled = as.enabled !== false;
@@ -74,6 +74,11 @@ function evaluate(state, cfg, now) {
           actions.push({ type: "warn-silence", silentSec: Math.round(silentSec), forceInSec: Math.round(forceAfter - silentSec), first: false });
         }
       } else {
+        /* A real warning -> clear transition is the ONLY thing that may tell the
+         * renderer its countdown is over. This branch runs on every idle tick, so
+         * the event is emitted only when a warning was actually outstanding —
+         * otherwise the UI would be told "silence ended" once per 15 s tick. */
+        if (s.warnedAt) actions.push({ type: "silence-cleared" });
         next.warnedAt = null;
       }
     }

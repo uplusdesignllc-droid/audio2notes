@@ -164,7 +164,7 @@
 
       <div class="card">
         <h2>说话人识别模型</h2>
-        <div id="speaker-rows" class="dirlist"></div>
+        <div id="speaker-model-rows" class="dirlist"></div>
       </div>
 
       <div class="card">
@@ -355,6 +355,24 @@
       </div>
     </section>
   </main>
+
+  <!-- 参会人弹窗：只在名单真正 needed 的时刻出现（停止录音 / 重编辑已有会议）。
+       故意没有「取消」——录音不能悄悄丢掉名单，结局只有「保存」或「维持原样」。 -->
+  <div id="participants-overlay" class="participants-overlay" hidden>
+    <div class="card participants-card">
+      <h2 id="participants-title">参会人</h2>
+      <p class="hint" id="participants-note"></p>
+      <div id="participants-rows" class="participants-rows"></div>
+      <button id="participants-add" class="ghost">添加一位</button>
+      <div class="row participants-actions">
+        <label class="check"><input type="checkbox" id="participants-noask" /> 以后停止时不要再问我</label>
+      </div>
+      <div class="row participants-actions">
+        <button id="participants-save" class="primary">保存</button>
+        <button id="participants-unchanged" class="ghost">不需要更改参会人</button>
+      </div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>

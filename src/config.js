@@ -43,6 +43,10 @@ const DEFAULTS = {
       keepWav: false,         // true = compress but keep the original wav
     },
   },
+  participants: {
+    askOnStop: true,     // show the participant roster modal when a recording stops
+    timeoutMs: 300000,   // how long notes generation waits for an answer (5 min)
+  },
   lifecycle: {
     notifyOnDone: true,       // desktop notification when the notes are ready
     autoQuitAfterMin: 15,     // quit when idle this long (0 = right after done, -1 = never)
@@ -50,10 +54,18 @@ const DEFAULTS = {
     autoStop: {
       enabled: true,          // stop a forgotten recording
       silenceMin: 2,          // minutes without speech before WARNING (harmless: recording continues)
-      forceStopAfterMin: 5,   // further minutes AFTER the warning before actually stopping (total 7)
+      forceStopAfterMin: 3,   // further minutes AFTER the warning before actually stopping (total 5)
       minFreeDiskGB: 2,       // stop recording when free space drops below this
       maxElapsedMin: 480,     // stop once a recording has run this long (0 = no time limit)
       levelThreshold: 8,      // LEVEL (0-100) counted as "speech" by capture.exe
+      /* Activity window for the forgotten-recording guard (src/activityTracker.js).
+       * Measured on a real recording: a Windows notification beep is 2.0-3.0 s of
+       * loud windows (4-6 samples, peak LEVEL 27-31) and must NOT count as speech,
+       * while real speech runs 12.5 s / 15.5 s / 30.0 s (mic) and 119.5 s (system)
+       * with peaks 36-82. So: >= 4 s of loud samples inside a 12 s window = active.
+       * Internal tuning, deliberately not in the Settings UI. */
+      activityWindowSec: 12,  // sliding window that "is this meeting still going" looks at
+      activityLoudSec: 4,     // loud seconds required inside that window to count as activity
     },
     meetingDetect: {
       enabled: true,

@@ -10,7 +10,7 @@ contextBridge.exposeInMainWorld("a2n", {
   setConfig: (partial) => ipcRenderer.invoke("config:set", partial),
   listDevices: () => ipcRenderer.invoke("devices:list"),
   startRecord: (opts) => ipcRenderer.invoke("record:start", opts),
-  stopRecord: () => ipcRenderer.invoke("record:stop"),
+  stopRecord: (reason) => ipcRenderer.invoke("record:stop", { reason }),
   openDir: (dir) => ipcRenderer.invoke("app:openDir", dir),
   chooseDir: () => ipcRenderer.invoke("app:chooseDir"),
   pickFile: (opts) => ipcRenderer.invoke("app:pickFile", opts),
@@ -53,4 +53,8 @@ contextBridge.exposeInMainWorld("a2n", {
   llmTest: (opts) => ipcRenderer.invoke("llm:test", opts),
   llmProviders: () => ipcRenderer.invoke("llm:providers"),
   onModels: (cb) => ipcRenderer.on("models", (_e, d) => cb(d)),
+  participantsAnswer: (opts) => ipcRenderer.invoke("participants:answer", opts),
+  participantsEdit: (opts) => ipcRenderer.invoke("participants:edit", opts),
+  participantsStatus: () => ipcRenderer.invoke("participants:status"),
+  onParticipants: (cb) => ipcRenderer.on("participants", (_e, d) => cb(d)),
 });

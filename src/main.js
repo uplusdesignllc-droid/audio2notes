@@ -12,15 +12,65 @@ const meetings = require("./meetings");
 const audioArchive = require("./audioArchive");
 const diarize = require("./diarize");
 const lifecyclePolicy = require("./lifecyclePolicy");
+const activityTracker = require("./activityTracker");
 const powerMode = require("./powerMode");
 const jobQueue = require("./jobQueue");
 const meetingDetect = require("./meetingDetect");
+const participants = require("./participants");
 const models = require("./models");
 const llmProviders = require("./llmProviders");
 const os = require("os");
 
 let win = null;
 let rec = { system: null, mic: null, levelTimers: [], busy: false, limitFired: false, limitReached: null };
+let gate = null;        // the single live participant gate (only one at a time)
+let gateTimeoutMs = null;
+
+/* One participant gate at a time. The timeout is re-read from the current
+ * settings on every stop, so a changed timeoutMs takes effect WITHOUT a restart
+ * — when it changes the gate is rebuilt (pending questions dropped first). */
+function getGate(timeoutMs) {
+  if (!gate || gateTimeoutMs !== timeoutMs) {
+    if (gate) for (const id of gate.pending()) gate.abandon(id);
+    gate = participants.createParticipantGate({ timeoutMs });
+    gateTimeoutMs = timeoutMs;
+  }
+  return gate;
+}
+
+/* Build the three participants meta fields, or {} when the resolved roster is
+ * empty/cancelled — never emit `[]` / null as if it were a real answer. */
+function participantFields(names, source, askedAt) {
+  if (!Array.isArray(names) || names.length === 0) return {};
+  return {
+    participants: names,
+    participantsSource: source || null,
+    participantsAskedAt: askedAt || null,
+  };
+}
+
+/* Ask for the meeting roster at stop — before the slow mixing/transcription —
+ * but ONLY when the user turned "ask on stop" on. The request is parked on
+ * `rec` and resolved exactly once by whichever path (live or deferred) follows. */
+function maybeRequestParticipants() {
+  rec.participantReq = null;
+  if (!rec.dir) return;
+  let p = {};
+  try { p = (config.load() && config.load().participants) || {}; } catch { return; }
+  if (!p.askOnStop) return;
+  const dir = rec.dir;
+  const title = path.basename(dir);
+  const g = getGate(p.timeoutMs);
+  let req;
+  try {
+    req = g.request({ dir, title, suggested: [], reason: "stop" });
+  } catch (e) {
+    console.error("[participants] request failed:", e);
+    return;
+  }
+  rec.participantReq = { id: req.id, dir, title, askedAt: new Date().toISOString() };
+  send("participants", { id: req.id, dir, title, prefill: req.prefill, reason: "stop" });
+}
 
 /* ---- lifecycle state -----------------------------------------------------
  * `lastActivity` drives the idle auto-quit; `lastLoudAt` drives the
@@ -46,12 +96,56 @@ function lifecycleCfg() {
     autoStop: {
       enabled: a.enabled !== false,
       silenceMin: typeof a.silenceMin === "number" ? a.silenceMin : 2,
-      forceStopAfterMin: typeof a.forceStopAfterMin === "number" ? a.forceStopAfterMin : 5,
+      forceStopAfterMin: typeof a.forceStopAfterMin === "number" ? a.forceStopAfterMin : 3,
       minFreeDiskGB: typeof a.minFreeDiskGB === "number" ? a.minFreeDiskGB : 2,
       maxElapsedMin: typeof a.maxElapsedMin === "number" ? a.maxElapsedMin : 480,
       levelThreshold: typeof a.levelThreshold === "number" ? a.levelThreshold : 8,
+      // named-field whitelist: a new autoStop field MUST be mirrored here or the
+      // tracker silently falls back to its own defaults (this bit us before)
+      activityWindowSec: typeof a.activityWindowSec === "number" ? a.activityWindowSec : 12,
+      activityLoudSec: typeof a.activityLoudSec === "number" ? a.activityLoudSec : 4,
     },
   };
+}
+
+/* ---- activity tracker (forgotten-recording guard) ------------------------
+ * ONE tracker, re-armed per recording; both tracks feed it, because the guard
+ * asks "is this meeting still going", not "which track is talking".
+ * The rule itself lives in src/activityTracker.js (pure, unit-tested): >= 4 s of
+ * loud samples inside a 12 s window. A single loud 300 ms sample — a notification
+ * beep measures 2.0-3.0 s of LEVEL 27-31 — must not reset the silence clock.
+ */
+let activity = null;      // null until the first recording starts
+let activityOpts = null;  // the tunables `activity` was built with
+
+/** Arm the forgotten-recording guard for a NEW recording: a fresh activity window
+ *  AND a fresh silence clock, because nothing may leak from the previous
+ *  recording. Both leaks are real, not theoretical:
+ *   - `lastLoudAt` drives `silentSec = now - lastLoudAt`, so a recording started
+ *     6 minutes after the previous one began already past its 5-minute silence
+ *     budget and was force-stopped on the first watchdog tick (within 15 s).
+ *   - a warning latch left set when the previous recording was stopped by hand
+ *     makes the policy announce a bogus "silence-cleared" (warnedAt was truthy,
+ *     silentSec back to ~0), which un-hides the banner of a recording that has
+ *     only just started. */
+function armRecordingGuard() {
+  const as = lifecycleCfg().autoStop;
+  const opts = {
+    windowSec: as.activityWindowSec,
+    loudSec: as.activityLoudSec,
+    sampleSec: activityTracker.DEFAULT_SAMPLE_SEC, // capture.exe writes a LEVEL line every rate/2 frames
+    levelThreshold: as.levelThreshold,
+  };
+  // Rebuild when the tunables changed (a hand-edited settings.json must take
+  // effect on the NEXT recording — reset() alone would keep the old numbers).
+  if (!activity || !activityOpts || Object.keys(opts).some((k) => activityOpts[k] !== opts[k])) {
+    activity = activityTracker.createActivityTracker(opts);
+    activityOpts = opts;
+  }
+  // reset() regardless: a new recording must never inherit the last one's samples.
+  activity.reset();
+  lifecycle.lastLoudAt = Date.now();
+  lifecycle.autoStopWarnedAt = null;
 }
 
 function isRecording() {
@@ -83,10 +177,16 @@ function freeDiskGB() {
   }
 }
 
-/** Desktop notification; click opens the meeting folder. Never throws. */
-function notifyUser(title, body, dir) {
+/** Desktop notification; click opens the meeting folder. Never throws.
+ *  `opts.silent` mutes the notification's OWN chime. That matters for the silence
+ *  warning: the chime plays through the default render endpoint, the loopback
+ *  track records it, and the loudness buffer would then reset the very guard the
+ *  notification is warning about (a chime measures 2.0-3.0 s of LEVEL 27-31 —
+ *  short enough for the activity window to ignore, but there is no reason to feed
+ *  the guard its own noise at all). */
+function notifyUser(title, body, dir, opts) {
   try {
-    const n = new Notification({ title, body });
+    const n = new Notification({ title, body, silent: !!(opts && opts.silent) });
     if (dir) n.on("click", () => shell.openPath(dir));
     n.show();
   } catch { /* notifications unavailable in this environment */ }
@@ -112,6 +212,13 @@ function createWindow() {
     },
   });
   win.loadFile(path.join(__dirname, "..", "renderer", "index.html"));
+
+  // A roster question may be pending when the window closes; abandon it so the
+  // in-flight wait() resolves ("cancelled") instead of blocking notes forever.
+  // Hooked on THIS window (not app shutdown) so it is tied to the actual UI.
+  win.on("closed", () => {
+    if (gate) for (const id of gate.pending()) gate.abandon(id);
+  });
 
   /* Closing the window must never silently discard work: before this existed,
    * before-quit() only stopped capture, so closing during a 2-hour meeting's
@@ -191,9 +298,17 @@ function startLifecycleWatchdog() {
         send("lifecycle", { type: "disk-low", freeGB: a.freeGB, limitGB: a.limitGB });
       } else if (a.type === "warn-silence") {
         if (a.first) {
-          notifyUser("录音似乎已经结束", `已 ${Math.round(a.silentSec / 60)} 分钟没有声音，${lc.autoStop.forceStopAfterMin} 分钟后将自动停止并处理。`);
+          // silent: the chime would be recorded by the loopback track and reset
+          // the silence clock this warning is about
+          notifyUser("录音似乎已经结束", `已 ${Math.round(a.silentSec / 60)} 分钟没有声音，${lc.autoStop.forceStopAfterMin} 分钟后将自动停止并处理。`, null, { silent: true });
         }
         send("lifecycle", { type: "silence-warning", silentSec: a.silentSec, forceInSec: a.forceInSec });
+      } else if (a.type === "silence-cleared") {
+        /* The renderer's banner is never hidden on this transition (its
+         * 「继续录音」 button is the only way to cancel a pending auto-stop) — this
+         * only tells it to swap the frozen countdown for the "monitoring again"
+         * text. Emitted by the policy on a real warn -> clear transition only. */
+        send("lifecycle", { type: "silence-cleared" });
       } else if (a.type === "warn-idle") {
         notifyUser("Audio2Notes 即将自动退出", `空闲 ${a.threshold} 分钟后自动退出（可在设置里关闭）。现在仍可继续使用。`);
       } else if (a.type === "stop") {
@@ -378,6 +493,8 @@ async function processQueuedDir(job) {
       // the same provenance the live pipeline records: capture.exe's READY format
       // and T0 anchor per track, carried through the queue instead of dropped
       capture: job.captureInfo || null,
+      // roster resolved at stop rode the queued job; {} (absent) when empty
+      ...participantFields(job.participants, job.participantsSource, job.participantsAskedAt),
     },
   });
   let archive = null;
@@ -428,16 +545,23 @@ async function runQueue(reason) {
 }
 
 /** Park a finished recording instead of transcribing it now (defer mode). */
-async function enqueueMeeting(dir, sources, durationSec, cfg, captureInfo) {
+async function enqueueMeeting(dir, sources, durationSec, cfg, captureInfo,
+  participants, participantsSource, participantsAskedAt) {
   let archive = null;
   try { archive = await archiveMeeting(dir, cfg); } catch (e) { console.error("archive failed:", e); }
   // keep the audio we will need later; the wavs are gone after archiving
+  // A roster only means something with names: gate all three fields on a
+  // non-empty list so a timeout/cancel never leaves a dangling source in the job.
+  const roster = Array.isArray(participants) && participants.length ? participants : null;
   const q = jobQueue.add(readQueue(), {
     dir,
     reason: "defer",
     sources: Object.keys(sources || {}),
     durationSec,
     captureInfo: captureInfo || null,
+    participants: roster,
+    participantsSource: roster ? participantsSource : null,
+    participantsAskedAt: roster ? participantsAskedAt : null,
   });
   writeQueue(q);
   send("queue", { type: "added", queue: q.jobs });
@@ -501,19 +625,41 @@ function scanLimitLine(text) {
   return { bytes: +m[1], limit: +m[2] };
 }
 
-/* ---- level polling (reads --status files; sandbox-safe) ------------------ */
+/* ---- level polling (reads --status files; sandbox-safe) ------------------
+ * Each track gets its own 300 ms timer, but the writer emits a LEVEL line only
+ * every ~0.5 s, so a poll sees 0, 1 or several NEW lines. `r.levelSeen` counts
+ * the LEVEL lines already fed to the tracker, so a line is observed exactly once;
+ * the new ones go in as ONE batch with capture-time timestamps (pushBatch),
+ * keeping the duty cycle in capture time instead of poll time. */
 function pollLevels() {
   for (const key of ["system", "mic"]) {
     const r = rec[key];
     if (!r) continue;
+    r.levelSeen = 0; // per recording: the status file starts empty
     const timer = setInterval(() => {
       let level = null;
+      let fresh = null;
       try {
         const text = fs.readFileSync(r.statusFile, "utf8");
         const lines = text.split(/\r?\n/).filter(Boolean);
         const last = lines[lines.length - 1];
         const m = last && last.match(/^LEVEL\s+(\d+)/);
         if (m) level = Math.max(0, Math.min(100, +m[1]));
+        // Count LEVEL lines instead of trusting the poll clock: a poll may see
+        // several, or (after a stall/sleep) a whole backlog.
+        let count = 0;
+        for (const ln of lines) if (ln.startsWith("LEVEL ")) count++;
+        if (count > r.levelSeen) {
+          fresh = [];
+          for (let i = lines.length - 1; i >= 0 && fresh.length < count - r.levelSeen; i--) {
+            const lm = lines[i].match(/^LEVEL\s+(\d+)/);
+            if (lm) fresh.push(Math.max(0, Math.min(100, +lm[1])));
+          }
+          fresh.reverse(); // chronological: oldest first, newest last
+          r.levelSeen = count;
+        } else if (count < r.levelSeen) {
+          r.levelSeen = count; // status file rewritten/truncated: resync, never stall
+        }
         // FINISHED is written AFTER the fuse line, so a "last line == LEVEL"
         // check would miss it — scan the whole file for a LIMIT line instead.
         // rec.limitFired makes this fire exactly once per recording; it resets
@@ -537,15 +683,21 @@ function pollLevels() {
           }
         }
       } catch { /* not ready yet */ }
-      if (level != null) {
-        send("level", { source: r.kind, level });
-        // any audible level counts as "this meeting is still going" — drives the
-        // forgotten-recording guard in startLifecycleWatchdog()
-        if (level >= lifecycleCfg().autoStop.levelThreshold) {
-          lifecycle.lastLoudAt = Date.now();
-          lifecycle.autoStopWarnedAt = null;
-          if (lifecycle.autoStopSuppressed) lifecycle.autoStopSuppressed = false;
-        }
+      // The meter must still see EVERY sample, not only the ones that count as
+      // activity — send() is unconditional by design.
+      if (level != null) send("level", { source: r.kind, level });
+      if (fresh && fresh.length && activity) activity.pushBatch(fresh, Date.now());
+
+      /* The forgotten-recording guard asks "is this meeting still going", not
+       * "was this one sample loud": a 2.5 s notification beep (peaks 27-31) must
+       * not reset it when real speech runs 12.5-119.5 s (peaks 36-82). Only a
+       * tracker verdict refreshes lastLoudAt, so the existing
+       * `silentSec = now - lastLoudAt` arithmetic in the watchdog is unchanged.
+       * autoStopWarnedAt is deliberately NOT cleared here: the policy has to see
+       * the warning -> clear transition to emit "silence-cleared" (defect A). */
+      if (activity && activity.isActive(Date.now())) {
+        lifecycle.lastLoudAt = Date.now();
+        if (lifecycle.autoStopSuppressed) lifecycle.autoStopSuppressed = false;
       }
     }, 300);
     rec.levelTimers.push(timer);
@@ -696,6 +848,7 @@ ipcMain.handle("record:start", async (_e, opts = {}) => {
     return { error: e.message };
   }
   rec = { ...rec, ...procs, dir, startTime: Date.now(), limitFired: false, limitReached: null, stopReason: null, captureInfo: null };
+  armRecordingGuard(); // fresh activity window + fresh silence clock: nothing leaks from the previous recording
   pollLevels();
   return { ok: true, dir };
 });
@@ -752,6 +905,9 @@ async function stopRecordingAndProcess() {
   /* Stash the per-track capture provenance on `rec` — the process handles are
    * cleared just below, but `rec.captureInfo` survives for the meta object. */
   rec.captureInfo = captureInfo;
+  // Ask for the roster now, at stop (before mixing/transcription) — gated on
+  // askOnStop inside. No-op when the setting is off; nothing leaks into meta.
+  maybeRequestParticipants();
   rec.system = null; rec.mic = null;
   const dir = rec.dir;
 
@@ -760,7 +916,15 @@ async function stopRecordingAndProcess() {
   const profile = await currentProfile().catch(() => null);
   if (profile && !profile.runNow) {
     try {
-      const q = await enqueueMeeting(dir, sources, durationSec, config.load(), rec.captureInfo || null);
+      // Resolve the roster question BEFORE parking the job, so the answer rides
+      // in the job (bounded by the gate timeout) rather than being asked after.
+      let partNames = null, partSource = null, partAsked = null;
+      if (rec.participantReq) {
+        const pr = await gate.wait(rec.participantReq.id);
+        partNames = pr.names; partSource = pr.source; partAsked = rec.participantReq.askedAt;
+      }
+      const q = await enqueueMeeting(dir, sources, durationSec, config.load(), rec.captureInfo || null,
+        partNames, partSource, partAsked);
       notifyUser("已排队（续航优先模式）", `${path.basename(dir)} —— 插电后自动转写`, dir);
       rec.busy = false;
       touchActivity();
@@ -770,6 +934,25 @@ async function stopRecordingAndProcess() {
       rec.busy = false;
       return { error: "排队失败：" + e.message, dir };
     }
+  }
+
+  /* Resolve the roster question BEFORE the first heavy step.
+   * The modal is still REQUESTED at exactly the same instant (maybeRequestParticipants()
+   * just above, right after the recording stopped), but the CPU-heavy work — ffmpeg
+   * mix -> Whisper transcription (in THIS process) -> Ollama notes — must not run
+   * while the user is typing in it. That overlap was the structural defect: the
+   * modal is requested the moment a recording stops, and the pipeline used to
+   * saturate every core for the next ~2 minutes, which is why typing lagged and
+   * clicks looked like they did nothing (they did register).
+   * The wait is kept in ONE place per path: the deferred branch above already
+   * awaited before enqueueMeeting (the answer rides inside the queued job and must
+   * NOT be awaited again inside the job itself, where no modal is ever shown).
+   * Nothing here can hang the pipeline: answer / unchanged / cancel / timeout /
+   * abandon (the window was closed) all resolve this same promise. */
+  let participantResult = null;
+  if (rec.participantReq) {
+    send("pipeline", { phase: "participants", message: "等待参会人确认（选择后继续处理）…" });
+    participantResult = await gate.wait(rec.participantReq.id);
   }
 
   send("pipeline", { phase: "mixing", message: "Mixing audio…" });
@@ -791,6 +974,11 @@ async function stopRecordingAndProcess() {
     send("transcript", transcript);
 
     const translated = await translateTranscript(transcript, cfg);
+
+    // The roster was already resolved BEFORE the mix (see the single gate.wait()
+    // above): participantResult is in hand here, and a second wait() would only
+    // see an already-settled gate. Keeping the answer that early also means the
+    // notes step never has to wait on the user again.
 
     send("pipeline", { phase: "summarizing", message: "Writing notes…" });
     const notes = await summarize.summarize(transcript.text, cfg, (p) =>
@@ -819,6 +1007,12 @@ async function stopRecordingAndProcess() {
       capture: rec.captureInfo || null,
       limitReached: rec.limitReached || null,
       stopReason: rec.stopReason || null,
+      // roster resolved at stop; {} (absent) when empty — never written as []
+      ...participantFields(
+        participantResult ? participantResult.names : null,
+        participantResult ? participantResult.source : null,
+        rec.participantReq ? rec.participantReq.askedAt : null
+      ),
     };
     meetings.writeArtifacts(dir, { transcript, notes, meta });
 
@@ -846,6 +1040,11 @@ async function stopRecordingAndProcess() {
       archive, archiveError,
       limitReached: rec.limitReached || null,
       stopReason: rec.stopReason || null,
+      // Hand the confirmed roster back to the renderer so the speaker-naming rows
+      // can offer these names immediately after THIS recording. Without it the
+      // suggestions would be empty exactly in the main flow, because showResult()
+      // resets its copy and the roster only comes back from meetings:open later.
+      participants: participantResult && Array.isArray(participantResult.names) ? participantResult.names : [],
     };
   } catch (e) {
     console.error("pipeline error:", e);
@@ -855,7 +1054,68 @@ async function stopRecordingAndProcess() {
   }
 }
 
-ipcMain.handle("record:stop", async () => stopRecordingAndProcess());
+ipcMain.handle("record:stop", async (_e, opts = {}) => {
+  // The renderer knows why it stopped ("silence" | "disk" | "meeting-app"); pass
+  // it through so meta.stopReason is honest. Only known reasons are accepted; an
+  // unknown or absent value falls back to "user". The "max-duration" fuse is set by
+  // the watchdog before stopRecordingAndProcess and is preserved, never clobbered.
+  const reason = opts && typeof opts.reason === "string" ? opts.reason : null;
+  if (reason === "silence" || reason === "disk" || reason === "meeting-app") {
+    rec.stopReason = reason;
+  } else if (rec.stopReason !== "max-duration") {
+    rec.stopReason = "user";
+  }
+  return stopRecordingAndProcess();
+});
+
+ipcMain.handle("participants:answer", async (_e, payload = {}) => {
+  const { id, ...rest } = payload || {};
+  if (!id) return { ok: false };
+  return { ok: gate ? !!gate.answer(id, rest) : false };
+});
+
+ipcMain.handle("participants:edit", async (_e, opts = {}) => {
+  const dir = opts && opts.dir;
+  if (!dir) return { error: "缺少会议目录" };
+  // Bound the names exactly like gate.answer() does — this path bypasses the gate,
+  // and an unbounded list would go straight into meta.json and from there into the
+  // notes UI. Sanitising here keeps ONE rule for both ways a roster can be set.
+  const names = participants.sanitize(Array.isArray(opts.names) ? opts.names : []);
+  const metaPath = path.join(dir, "meta.json");
+  // Read the existing meta (tolerating missing/corrupt), then merge. An empty
+  // names list means "clear the roster" — the three keys are removed, never written [].
+  let meta = {};
+  try {
+    const raw = fs.readFileSync(metaPath, "utf8");
+    const j = JSON.parse(raw.replace(/^\uFEFF/, ""));
+    if (j && typeof j === "object" && !Array.isArray(j)) meta = j;
+  } catch { /* missing or corrupt meta.json -> start from {} */ }
+  if (names.length === 0) {
+    delete meta.participants;
+    delete meta.participantsSource;
+    delete meta.participantsAskedAt;
+  } else {
+    meta.participants = names;
+    meta.participantsSource = "manual";
+    meta.participantsAskedAt = new Date().toISOString();
+  }
+  try {
+    fs.mkdirSync(path.dirname(metaPath), { recursive: true });
+    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), "utf8");
+  } catch (e) {
+    return { error: "写入失败：" + e.message };
+  }
+  return { ok: true };
+});
+
+ipcMain.handle("participants:status", async () => {
+  const p = (config.load() && config.load().participants) || {};
+  return {
+    askOnStop: !!p.askOnStop,
+    timeoutMs: p.timeoutMs || 300000,
+    pending: (gate && gate.pending()) || [],
+  };
+});
 
 ipcMain.handle("file:transcribe", async (_e, filePath) => {
   if (rec.busy) return { error: "busy" };
@@ -1393,6 +1653,10 @@ ipcMain.handle("meetings:open", async (_e, { dir } = {}) => {
     out.provider = m.notesProvider;
     out.durationSec = m.durationSec;
     out.notesFallbackReason = m.notesFallbackReason || null;
+    // The roster the user confirmed at stop (P6). Surfaced to the renderer so the
+    // speaker-naming rows can offer these names as datalist suggestions — the whole
+    // point of asking at stop is that the names are on hand when speakers are named.
+    out.participants = Array.isArray(m.participants) ? m.participants : [];
   } catch { /* optional */ }
   touchActivity();
   return out;

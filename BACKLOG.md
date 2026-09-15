@@ -444,6 +444,10 @@ panel and line 167 is the Settings 「说话人识别模型」 card, and `$()` r
 order — so `loadModels()` (`renderer/app.js:658`) writes the voiceprint model row **into the meeting
 speaker panel**, and the Settings card is never populated at all. Both are silent. Fixed by renaming
 the Settings element to `speaker-model-rows`.
+**FIXED 2026-09-14** and verified mechanically: a checker extracts every `id=` in `index.html` and
+asserts uniqueness (120 ids, 0 duplicates; `speaker-rows` and `speaker-model-rows` once each), and a
+second checker resolves every static `$("…")` literal in `renderer/app.js` against `index.html`
+(108 references, 0 missing, no pre-existing mismatches either).
 
 **The owner's requested shape (2026-09-14):** a **popup/modal**, shown **automatically at the
 moment manual input is needed**, carrying an explicit **「不需要更改参会人」** option so it can be
@@ -466,10 +470,17 @@ is real:
 Recommendation: **(a) with the skip option**, because it is the only variant that pays for itself
 in transcript quality; fall back to (b)/(c) if it turns out to nag.
 
-**DECIDED by the owner 2026-09-14: variant (a) — pop up at stop.** Implemented in this same
-session (see §7 for the resulting files). The owner's exact requested shape is honoured: the popup
-fires automatically, and 「不需要更改参会人」 is a first-class one-click dismissal alongside a
-persisted 「以后停止时不要再问我」 preference.
+**DECIDED by the owner 2026-09-14: variant (a) — pop up at stop.** **IMPLEMENTED 2026-09-14** —
+see §8 for the completion record and the two defects found during review. The owner's exact
+requested shape is honoured: the popup fires automatically, and 「不需要更改参会人」 is a first-class
+one-click dismissal alongside a persisted 「以后停止时不要再问我」 preference.
+
+> **Correction.** An earlier revision of this section said the feature was "implemented in this
+> same session". That was false — nothing was on disk; only the design existed, and the work was
+> handed off. It was written in the *following* session. Left visible because this is the fourth
+> instance of the write-an-inference-as-a-fact pattern already recorded in P3-3 (there: a wrong
+> claim about `keepWav`, a wrong `.tools` fallback, and the "Task Manager CPU is inflated"
+> generalisation). An entry in this file is a claim like any other and needs the same check.
 
 ⚠ **Checked 2026-09-14 — option 2 is NOT available out of the box, which changes how much
 variant (a) is worth.** `@xenova/transformers` 2.17.2 has **no `initial_prompt` support at all**
@@ -513,10 +524,15 @@ mostly about *when the user is asked* rather than about transcript quality.
 set to `"max-duration"`. The meeting that ended via the meeting-app-quiet rule recorded nothing,
 so which mechanism stopped a recording has to be inferred from timings. The renderer knows the
 reason when it calls `record:stop` for an auto-stop-request — pass it through and record it.
+**FIXED 2026-09-14:** `stopRecord(reason)` now forwards the reason, and the `record:stop` handler
+(`main.js:951`) accepts `"silence" | "disk" | "meeting-app"` and maps anything else (including the
+`"manual"` the Stop button sends) to `"user"`. `"max-duration"`, set by the watchdog before the stop,
+is explicitly preserved rather than clobbered — a plain `rec.stopReason = reason` would have
+overwritten it whenever the timeout fuse and a renderer stop raced.
 
-**Implementation contract designed 2026-09-14, NOT yet written** (an implementation subagent was
-stopped before it wrote anything, so nothing exists on disk yet). The owner decided variant (a) —
-pop up at stop. Keep this shape:
+**Implementation contract designed 2026-09-14 and WRITTEN 2026-09-14** — every bullet below is
+implemented and verified; §8 records the two places where reality differed from this contract.
+The owner decided variant (a) — pop up at stop. The delivered shape:
 
 - **New module `src/participants.js`**, dependency-free CommonJS, **no `electron` import** so it is
   unit-testable under plain `node`. Exports `createParticipantGate({ timeoutMs = 300000, now })`
@@ -535,6 +551,8 @@ pop up at stop. Keep this shape:
   `participants` entirely when the list is empty rather than writing `[]` as if it were an answer.
   ⚠ Add these fields to every named-field whitelist that would otherwise drop them — this codebase
   has already lost a field that way once (`jobQueue.add()`, see §7).
+  **Done:** `jobQueue.add()` whitelists all three at `jobQueue.js:55-57`, each gated on a
+  non-empty roster so a job can never carry a `participantsSource` without names.
 - **IPC:** `participants:answer`, `participants:edit` (user-initiated re-edit of an existing
   meeting: `reason:"manual"`, persists, and deliberately does **not** regenerate the notes — that
   stays the existing manual 「重新生成笔记」 action) and `participants:status`; mirrored in
@@ -784,3 +802,179 @@ this is not specific to scripting.
   the call, not tidied up after it.
 - **P0 note:** the fuse threshold and the maximum-duration guard (§4 items 1 and 2) are still
   unconfirmed decisions; P1's padding makes the fuse's trigger time wall-clock-predictable.
+
+## 8. P6 completion record (2026-09-14)
+
+Base `596102e`; **not committed**. Files, from `git diff --numstat`: `src/participants.js`
+(new, 247 lines), `src/main.js` (+161/−3), `src/jobQueue.js` (+10),
+`src/preload.js` (+5/−1), `renderer/app.js` (+149/−2), `renderer/index.html` (+19/−1),
+`renderer/styles.css` (+22), `src/config.js` (+4).
+
+### 8.1 What was built
+- **`src/participants.js`** — `createParticipantGate({ timeoutMs, now })` with
+  `request / wait / answer / pending / abandon`. Electron-free and fs-free on purpose so it is
+  drivable under plain `node`. `wait()` never rejects, one live request per `dir`, every timer
+  `.unref()`ed, and a *settled* outcome is retained so a late `wait()` recovers the real answer
+  instead of hanging or lying.
+- **Trigger = variant (a).** `maybeRequestParticipants()` runs in `stopRecordingAndProcess()`
+  immediately after `rec.captureInfo = captureInfo;` — before mixing/transcription, so the user is
+  asked while still in front of the app. Gated on `participants.askOnStop`.
+- **Resolved exactly once.** Live path: `await gate.wait(...)` after `translateTranscript` and
+  immediately before `summarize.summarize`. Deferred path: awaited before `enqueueMeeting`, so the
+  answer rides in the job (whitelisted) rather than being asked after the fact.
+- **Modal** — the app's first overlay. Enter saves; **Escape = 「不需要更改参会人」, never cancel**;
+  both buttons disable on click so a double-click cannot double-answer; `{ok:false}` (server-side
+  timeout) still closes the modal and says so rather than wedging.
+- **Two bundled bugs fixed** — the duplicate `speaker-rows` id and the dead `meta.stopReason`
+  (both detailed in §2 P6).
+
+### 8.2 Verified, and how (no step accepted from a self-report)
+| check | result |
+|---|---|
+| `node --check` × 6 changed files | all exit 0 |
+| `.scratch/p6-participants-test.js` (gate semantics) | 37 assertions, **12/12 scenarios PASS**, exit 0 |
+| `.scratch/p6-jobqueue-test.js` (whitelist round-trip) | 15 PASS, exit 0, incl. a field-less legacy `queue.json` |
+| `.scratch/check-ids.js` (HTML id uniqueness) | 120 ids, **0 duplicates** |
+| `.scratch/resolve-ids.js` (`$()` → existing id) | 108 refs, **0 missing** |
+| `.scratch/check-a2n-surface.js` (renderer calls vs preload) | 51 exposed / 46 used, **0 missing** |
+
+The last check is the one worth keeping: it cross-references every `window.a2n.X` the renderer calls
+against the names `preload.js` actually exposes, which is the exact failure a frozen interface
+written by three separate hands invites.
+
+### 8.3 Two defects found during review, not by the implementers
+1. **The roster never reached the speaker-naming UI in the main flow.** `stopRecordingAndProcess()`'s
+   success return omitted `participants`, so `showResult(res)` reset the renderer's copy to `[]` and
+   the `<datalist>` suggestions were empty *precisely* after a recording where the user had just
+   typed the roster — the feature's primary path. Fixed by returning the confirmed names
+   (`main.js:941`); the deferred path is unaffected because it re-reads them from `meta.json`.
+2. **`participants:edit` bypassed sanitisation.** `answer()` sanitises through the gate (trim,
+   drop non-strings, case-insensitive dedupe, ≤80 chars, ≤40 entries), but the edit path wrote
+   `opts.names` straight into `meta.json`. Same input, two different rules. Fixed by exporting
+   `sanitize` from `participants.js` and using it in the handler, so one rule governs both ways a
+   roster can be set.
+
+### 8.4 Corrections to this document's own contract
+- The queued `meta` builder is `processQueuedDir(job)`, **not** `processJob()`; the line range the
+  contract cited (`main.js:350-381`) was right, the function name was not.
+- The contract assumed a manual stop calls `stopAndProcess()` with no argument. It actually passes
+  `"manual"` (`renderer/app.js:431`). Harmless — the main-process handler maps it to `"user"` — but
+  the assumption was wrong and is recorded rather than quietly patched.
+- **All line numbers cited in §2 P6 above are PRE-implementation and have drifted.** They describe
+  the tree at `596102e`, before the renderer gained a modal and `main.js` gained ~160 lines. Treat
+  them as historical: e.g. `loadModels()`'s speaker box was `renderer/app.js:658` and is now `:661`,
+  and `renderSpeakerRows()` moved from `:981` to `:1114`. The §8 numbers are the current ones.
+
+### 8.5 Still not verified — the owner must do this
+
+> **SUPERSEDED 2026-09-14 20:46:50 — the feature HAS now actually run.** The owner recorded and
+> stopped a real meeting and the modal appeared and worked: `meta.json` carries
+> `participants: ["mike"]`, `participantsSource: "answered"`, and
+> `participantsAskedAt: "2026-09-15T00:46:50.936Z"` (exactly the stop instant). See §9.6. Two
+> corrections to §8 while we are here: `participantsAskedAt` is an **ISO-8601 string**, not epoch
+> milliseconds; and the base commit `596102e` was made **before** this implementation existed
+> (10:28 vs 12:50-13:26 file times), so §8.4's "line numbers describe the tree at `596102e`" is
+> right and §8's own numbers are the post-implementation ones.
+
+Everything above is **static**. Electron cannot start in this sandbox (named pipes → "Access is
+denied (0x5)"), so **the feature has never actually run**. The real acceptance test is unchanged:
+record, stop, confirm the modal appears, save a roster, and check that `meta.json` carries
+`participants` / `participantsSource: "answered"` / `participantsAskedAt`, that the speaker-name
+inputs suggest those names, and that ticking 「以后停止时不要再问我」 produces **no** modal and **no**
+participant keys on the next recording. Also worth a look: in defer mode the stop now blocks on the
+gate for up to `timeoutMs` (5 min) if nobody answers — bounded, but visible to the user.
+
+## 9. Silence-guard rework + P6 modal responsiveness (2026-09-14 evening)
+
+Implemented and verified in one session. **Uncommitted P6 work was still sitting in the tree when
+this started** (its subagent finished writing hours after it was told to stop — see the note in
+§8.5), and the two changesets interleave inside `main.js` / `config.js`, so they are committed
+together rather than as two commits.
+
+### 9.1 What was built
+- **`src/activityTracker.js` (NEW, pure, Electron-free)** — the forgotten-recording guard no longer
+  treats a single 300 ms LEVEL sample as "someone is talking". It now requires **≥ 4 s of loud
+  samples inside a sliding 12 s window**, fed from *capture-time* timestamps (`pushBatch` spreads a
+  multi-line poll backwards at 0.5 s per line) because the writer emits a LEVEL line every 500 ms
+  while the poller runs every 300 ms. New config keys `autoStop.activityWindowSec: 12` /
+  `activityLoudSec: 4`, deliberately **not** exposed in the Settings UI.
+- **Threshold retune** — `forceStopAfterMin` 5 → **3**, i.e. warn at 2 min and force-stop at **5 min
+  total** (was 7). Defaulted in all five places (`config.js:57`, `lifecyclePolicy.js:29`,
+  `main.js:99`, `renderer/app.js:141`, `:216`) or the UI and the logic would disagree.
+- **The warning can no longer cancel itself** — `notifyUser(title, body, dir, opts)` gained
+  `opts.silent`, and the silence warning passes `{ silent: true }` (`main.js:303`). Before this, the
+  app's own notification chime was captured by the system loopback, reset the silence clock, and
+  cleared the very warning it had just raised.
+- **The banner stopped lying** — it is **never hidden** when silence ends, because the 「继续录音」
+  escape hatch lives inside it; only its text changes state, between a **live 1 s countdown**
+  recomputed from an absolute deadline that is re-synced on every push, 「声音已恢复，仍在监控。」
+  and the keep-alive confirmation. New `silence-cleared` action in `lifecyclePolicy.js:81`, carried
+  over the **existing** `lifecycle` channel (no new channel, no preload change).
+- **P6 modal responsiveness** — the single `gate.wait()` moved from after the transcript to
+  **before the first heavy step** (`main.js:955`; the mix is at `:961` and the request is still at
+  `:910`), so ffmpeg/Whisper no longer compete with the modal for the CPU while the user types. Plus
+  `scrollIntoView({block:"nearest"})` and a flash on a newly added row, a bounded `.participants-rows`
+  scroll area so a long roster cannot push the action buttons off screen, `:active`/`:disabled`
+  button states, and a 「保存中…」 pending label restored on both open and close.
+
+### 9.2 A significant pre-existing bug this rework exposed
+`lifecycle.lastLoudAt` was **never reset on `record:start`**. Verified against `HEAD`, which writes
+it in only three places: the module initializer, `pollLevels` on a loud sample, and the keep-alive
+handler. Since the guard's arithmetic is `silentSec = now - lastLoudAt`, **starting a recording more
+than the silence budget after the previous one inherited that budget and was force-stopped on the
+first watchdog tick (~15 s in, reason `silence`)**. It hid because the first loud sample normally
+refreshes the clock within a second — it only fired when the first ~15 s of a new recording were
+silent. Fixed by `armRecordingGuard()` (`main.js:131-149`), which also clears a stale
+`autoStopWarnedAt`; without that second line, a warning left set when a recording was stopped by hand
+made the new `silence-cleared` event pop a bogus banner on the *next* recording.
+
+### 9.3 The 2026-09-14 20:33:32 recording is the proof the old guard was broken
+797.2 s recorded, real audio ended at **20:35:32**, and the owner stopped it **by hand at 20:46:50**
+(`meta.stopReason = "user"`) — after **11 min 18 s of silence**. The system track produced **8 loud
+runs; 7 were 2.0–3.0 s** (peaks 27–31, notification chimes) and one was 119.5 s (peak 82, the real
+audio); the mic track was silent for 693 s of the 797 s. Every chime reset the old single-sample
+clock — the last one landed 14 s before the manual stop. Under the new rule all 7 chimes are
+rejected (none reaches 4 s, and no two fall inside one 12 s window), so the recording would have
+stopped at **20:40:32** — 6 min 18 s earlier, with none of that silence reaching the transcript.
+
+### 9.4 Verification actually performed (no step accepted from a self-report)
+| check | result |
+|---|---|
+| `node --check` × 8 changed/new JS | all exit 0 |
+| `.scratch/activityTracker.test.js` | **10/10 PASS**, incl. the 2.5 s-chime regression and an out-of-order-arrival bug the test itself caught |
+| `.scratch/lifecyclePolicy.test.js` | 3/3 PASS |
+| `.scratch/pollLevels.harness.js` — the **real** `main.js` under a stubbed `electron`, real 300 ms timers, the real 15 s watchdog | **10/10 PASS**, and re-run by the reviewer *after* the last `main.js` edit |
+| `.scratch/p6-participants-test.js` / `.scratch/p6-jobqueue-test.js` | 12 scenarios ALL PASS / ALL PASS |
+| `forceStopAfterMin` defaults | grepped: all five read 3 |
+| Fix 1 ordering | read by line number: request `:910` → await `:955` → mix `:961`; only two `gate.wait` sites exist in the file |
+| the `lastLoudAt` claim | checked against `HEAD`, not accepted on trust |
+
+**Not verified: anything visual.** Electron cannot launch in this sandbox, so the banner countdown,
+the row flash, `scrollIntoView`, the button states and the 46vh rows cap were reviewed statically
+only. Whether Windows actually suppresses a `silent: true` chime for this app's AUMID is untested.
+
+### 9.5 Deliberately left undone
+- **Two chimes inside one 12 s window still defeat the duty cycle** (2.0 + 2.5 = 4.5 s ≥ 4 s).
+  Measured gaps in the 20:33 recording were 26–98 s, so it did not trigger, but a burst of
+  notifications could. `activityLoudSec: 5` or `activityWindowSec: 8` both buy margin, and both are
+  already config keys.
+- **Only the silence warning is silent.** The meeting auto-start notice, 「会议似乎结束了」 and the
+  size-fuse notice still chime while the loopback is live, so the app can still perturb its own
+  guard (see above). Silencing every notification emitted *while recording* is a one-line-each change
+  that has not been made.
+- **Transcription still runs in the Electron main process**, so any future interactive UI shown
+  during transcription will lag exactly the same way. Moving it into a worker or child process is a
+  separate, larger change.
+- **`tools/audit-meetings.js` has an inverted severity rule.** On the same run,
+  `2026-09-14_080926` at `effective 15.8 kbps` (50.6 % deviation) is **INFO** while
+  `2026-09-14_203332` at `17.5 kbps` (45.3 % deviation) is **WARN** — the two rules overlap at the
+  50 % boundary, so the *worse* case is reported as the *milder* one. This script is the acceptance
+  instrument, so it should be fixed before its verdicts are trusted again.
+- **`meta.participantsAskedAt` is an ISO-8601 string**, not epoch ms as §8 implied.
+
+### 9.6 P6 acceptance — passed in a real run
+The 20:33:32 recording is the acceptance test §8.5 asked for:
+`participants = ["mike"]`, `participantsSource = "answered"`,
+`participantsAskedAt = 2026-09-15T00:46:50.936Z` (exactly the stop instant), `stopReason = "user"`,
+and per-track `capture` provenance with both T0 anchors. Still unverified: the deferred/queued path,
+the speaker-name inputs being prefilled from the roster, and the 「以后停止时不要再问我」 preference.
