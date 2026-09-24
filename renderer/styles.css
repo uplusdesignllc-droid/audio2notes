@@ -51,6 +51,13 @@ main { padding: 18px 24px 40px; max-width: 1100px; }
 .spk-label { min-width: 62px; color: var(--muted); font-size: 13px; }
 .spk-name { width: 170px; padding: 4px 8px; background: var(--card2); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; }
 .spk-name:focus { outline: none; border-color: var(--accent); }
+/* roster picker: an alternative to typing a name that was already entered in the
+   participants modal. Sized to sit beside the name box, not to dominate the row. */
+.spk-pick {
+  max-width: 170px; padding: 4px 6px; font-size: 13px;
+  background: var(--card2); color: var(--fg); border: 1px solid var(--border); border-radius: 6px;
+}
+.spk-pick:focus { outline: none; border-color: var(--accent); }
 .spk-meta { color: var(--muted); font-size: 12px; }
 .spk-merge { max-width: 130px; }
 
@@ -187,6 +194,9 @@ button.ghost { background: none; }
 }
 .seg button.active { background: var(--accent); color: #fff; }
 .seg button:not(.active):hover { color: var(--fg); }
+
+/* UI language selector, pushed to the right end of the tab bar. Reuses .seg. */
+.tabs .lang-seg { margin-left: auto; }
 
 .chunk-list {
   background: var(--card2); border: 1px solid var(--border); border-radius: 8px;

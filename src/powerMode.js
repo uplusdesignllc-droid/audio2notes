@@ -136,4 +136,28 @@ function describe(profile) {
   return parts.join(" · ");
 }
 
-module.exports = { MODES, MODEL_LADDER, modelRank, capModel, resolveProfile, describe };
+/**
+ * The same badge, as separate parts instead of one pre-joined string.
+ *
+ * WHY THIS EXISTS: describe() returns a " · "-joined Chinese line, and no dictionary
+ * key can ever match it (a key would have to be the whole sentence, and the values
+ * in it vary). So the English UI showed the composite in Chinese — the "引擎: CPU"
+ * in the owner's screenshot was exactly this. A renderer cannot translate a
+ * pre-joined line; it has to receive the pieces and resolve each one.
+ *
+ * `describe()` is kept as-is for any caller that wants the plain string.
+ * @returns {{label:string, enginePrefix:string, engine:string, modelPrefix:string,
+ *            model:string, runNow:string}} all user-visible, all translatable pieces
+ */
+function describeParts(profile) {
+  return {
+    label: `${profile.label}`,
+    enginePrefix: "引擎：",
+    engine: `${profile.engine.label}`,
+    modelPrefix: "模型：",
+    model: String(profile.model || "").replace("Xenova/whisper-", "") || "?",
+    runNow: profile.runNow ? "录音后立即转写" : "排队等插电",
+  };
+}
+
+module.exports = { MODES, MODEL_LADDER, modelRank, capModel, resolveProfile, describe, describeParts };

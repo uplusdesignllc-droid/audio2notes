@@ -28,7 +28,10 @@ const DEFAULT_THRESHOLD = 0.7; // validated against known speaker counts
 const EMBEDDING_MODEL = "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx";
 const EMBEDDING_URL =
   "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/" + EMBEDDING_MODEL;
-const EMBEDDING_BYTES = 29596978; // 28.2 MB (release asset size)
+/* 28 281 164 bytes — the size of the release asset this app actually ships and
+ * downloads, verified by SHA-256 AA3CFC16…CEBA2 on 2026-09-22. (The old value
+ * 29596978 was documentation-grade wrong; the check below is `* 0.9` either way.) */
+const EMBEDDING_BYTES = 28281164;
 
 /** Bundled segmentation model, mapped out of asar when packaged. */
 function segmentationModelPath() {
@@ -37,20 +40,111 @@ function segmentationModelPath() {
   return p;
 }
 
+/** Where a downloaded voiceprint model is cached (per-user). */
 function embeddingModelPath(modelDir) {
   return path.join(modelDir, "speaker", EMBEDDING_MODEL);
 }
 
-function modelsStatus(modelDir) {
+/**
+ * The voiceprint model BUNDLED INSIDE the app, mapped out of asar when packaged.
+ *
+ * It ships with the app so speaker recognition needs no network access on first
+ * use: the 27 MB download used to be a hard prerequisite for the very first
+ * recording, which made the feature silently unavailable offline. Apache-2.0 —
+ * see assets/models/LICENSE-3d-speaker-campplus.txt, shipped beside the model.
+ */
+function bundledEmbeddingModelPath() {
+  let p = path.join(__dirname, "..", "assets", "models", EMBEDDING_MODEL);
+  if (p.includes("app.asar" + path.sep)) p = p.replace("app.asar" + path.sep, "app.asar.unpacked" + path.sep);
+  return p;
+}
+
+/**
+ * Is this a usable voiceprint model file? Size is the test the loader relies on.
+ * A partial `.part` download never reaches the real filename, so size is enough.
+ */
+function embeddingReady(p) {
+  try { return fs.statSync(p).size > EMBEDDING_BYTES * 0.9; } catch { return false; }
+}
+
+/**
+ * Resolve which voiceprint model to actually load.
+ *
+ * The per-user cache WINS over the bundled copy, deliberately: a user who clicked
+ * 下载 in Settings expects to be running what they downloaded (and 删除 must mean
+ * something), so the bundle is the fallback, not an override. An explicitly passed
+ * `modelDir` that already holds the file is honoured as-is, which keeps callers and
+ * tests that manage their own directory working.
+ *
+ * `opts.bundledModelPath` overrides where the bundled copy is looked for. That exists
+ * so tests can exercise BOTH branches (bundle present / absent) without moving the
+ * real 27 MB file around; production callers never pass it.
+ * @returns {string} the path to load, even if the file does not exist — callers that
+ *   care about existence use `embeddingReady`/`modelsStatus`. Never throws.
+ */
+function resolveEmbeddingModel(modelDir, opts) {
+  const bundled = (opts && opts.bundledModelPath) || bundledEmbeddingModelPath();
+  try {
+    const user = embeddingModelPath(modelDir);
+    if (embeddingReady(user)) return user;
+  } catch { /* fall through to the bundled copy */ }
+  return bundled;
+}
+
+function modelsStatus(modelDir, opts) {
   const seg = segmentationModelPath();
-  const emb = embeddingModelPath(modelDir);
+  const user = embeddingModelPath(modelDir);
+  const bundled = (opts && opts.bundledModelPath) || bundledEmbeddingModelPath();
   const has = (p, min) => {
     try { return fs.statSync(p).size > min; } catch { return false; }
   };
+  const userReady = embeddingReady(user);
+  const bundledReady = embeddingReady(bundled);
+  const resolved = resolveEmbeddingModel(modelDir, opts);
   return {
     segmentation: { path: seg, ready: has(seg, 200000) },
-    embedding: { path: emb, ready: has(emb, EMBEDDING_BYTES * 0.9) },
+    /* `path` stays the per-user download location so the Settings card keeps
+     * offering 下载/删除 against it; `resolvedPath`/`source` say what will really be
+     * loaded, which can now be the bundled copy. */
+    embedding: {
+      path: user,
+      ready: userReady || bundledReady,
+      downloaded: userReady,
+      bundled: { path: bundled, ready: bundledReady },
+      resolvedPath: resolved,
+      source: userReady ? "downloaded" : bundledReady ? "bundled" : null,
+    },
   };
+}
+
+/**
+ * Pure preflight for automatic diarization: is every native/model prerequisite
+ * present? Never throws, never downloads, never spawns anything — the caller uses
+ * it to decide whether to skip with an honest reason instead of failing mid-pipeline.
+ * `reason` is user-facing copy; `missing` is the MACHINE-READABLE classification
+ * (null | "sherpa" | "segmentation" | "embedding") callers must branch on, so
+ * editing the message can never silently change what the pipeline does.
+ */
+function preflight(o) {
+  // Destructured from `o || {}` rather than in the parameter list: a destructuring
+  // parameter throws on null before any guard can run, and this is called from inside
+  // the recording pipeline, where a throw costs the user their notes.
+  const { modelDir, sherpaReady, bundledModelPath } = o || {};
+  if (!sherpaReady) {
+    return { ok: false, missing: "sherpa", reason: "sherpa-onnx 不可用：" + String(sherpaReady === undefined ? "未检测" : sherpaReady) };
+  }
+  const seg = segmentationModelPath();
+  let segOk = false;
+  try { segOk = fs.statSync(seg).size > 200000; } catch { segOk = false; }
+  if (!segOk) return { ok: false, missing: "segmentation", reason: "缺少分割模型" };
+  /* Uses the same resolution as the real run, so the BUNDLED copy counts and a fresh
+   * install is ready immediately instead of reporting "not downloaded". Never
+   * downloads: a model that is absent everywhere is reported, not fetched. */
+  const emb = resolveEmbeddingModel(modelDir, { bundledModelPath });
+  if (!embeddingReady(emb)) {
+    return { ok: false, missing: "embedding", reason: "声纹模型尚未下载（首次识别需要下载约 27 MB）" };
+  }
+  return { ok: true, missing: null, reason: null };
 }
 
 function download(url, dest, onProgress, redirects = 0) {
@@ -127,8 +221,10 @@ function loadSherpa() {
 async function diarize({ audioPath, modelDir, threshold = DEFAULT_THRESHOLD, numThreads = 4, workDir, onProgress } = {}) {
   const st = modelsStatus(modelDir);
   if (!st.segmentation.ready) throw new Error("缺少分割模型（assets/models/pyannote-segmentation-3-0.int8.onnx）");
-  const embPath = await ensureEmbeddingModel(modelDir, onProgress);
-
+  /* A usable model — a previously downloaded copy, else the one bundled inside the
+   * app — is used as-is. Only when NEITHER exists is anything fetched, so shipping
+   * the model really does remove the first-run network dependency. */
+  const embPath = st.embedding.ready ? st.embedding.resolvedPath : await ensureEmbeddingModel(modelDir, onProgress);
   const sherpa = loadSherpa();
   const wd = workDir || os.tmpdir();
   if (onProgress) onProgress({ phase: "decoding" });
@@ -202,10 +298,26 @@ async function buildSamples({ audioPath, speakers, segments, outDir, targetSec =
   return out;
 }
 
-/** Give every transcript chunk the speaker of the diarization segment it overlaps most. */
-function assignToChunks(chunks, segments, fallbackId = null) {
+/**
+ * Give every transcript chunk the speaker of the diarization segment it overlaps most.
+ *
+ * `skipId` (default "you") marks the chunk identity that diarization must NOT touch.
+ * This is load-bearing, not a nicety: the transcript is a SINGLE interleaved array in
+ * which mic chunks are tagged `speaker: "you"` and system chunks `"remote"`
+ * (meetings.mergeTracks), while diarization only ever analyses the SYSTEM track. So
+ * without the guard, every mic chunk that overlaps a remote speaker's segment — or
+ * merely follows one, via the `last` fallback below — has its `"you"` identity
+ * overwritten with a remote `spkN`, i.e. the user's own speech is attributed to
+ * someone else in the transcript, the notes prompt and the 发言人 panel. Measured on
+ * a real 240 s recording: 2/2 mic chunks were relabelled this way.
+ * Pass `skipId: null` only if the chunk array is known to contain remote audio only.
+ */
+function assignToChunks(chunks, segments, fallbackId = null, skipId = "you") {
   let last = fallbackId;
   for (const c of chunks || []) {
+    // A chunk from the physically separate microphone path keeps its own identity:
+    // it is not part of the audio diarization looked at, so it has no spkN to map to.
+    if (skipId && c.speaker === skipId) continue;
     let best = null;
     let bestOverlap = 0;
     for (const s of segments) {
@@ -313,9 +425,13 @@ module.exports = {
   DEFAULT_THRESHOLD,
   EMBEDDING_MODEL,
   EMBEDDING_URL,
+  EMBEDDING_BYTES,
   segmentationModelPath,
   embeddingModelPath,
+  bundledEmbeddingModelPath,
+  resolveEmbeddingModel,
   modelsStatus,
+  preflight,
   ensureEmbeddingModel,
   diarize,
   buildSamples,

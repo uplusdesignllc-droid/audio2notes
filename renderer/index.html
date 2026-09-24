@@ -15,9 +15,13 @@
   <nav class="tabs">
     <button id="tab-record" class="tab active">Record</button>
     <button id="tab-import" class="tab">Import Audio</button>
-    <button id="tab-history" class="tab">历史会议</button>
-    <button id="tab-models" class="tab">模型与接口</button>
+    <button id="tab-history" class="tab">History</button>
+    <button id="tab-models" class="tab">Models &amp; Interfaces</button>
     <button id="tab-settings" class="tab">Settings</button>
+    <div id="ui-lang" class="seg lang-seg" role="group" aria-label="Language">
+      <button data-lang="en" class="active">English</button>
+      <button data-lang="zh">中文</button>
+    </div>
   </nav>
 
   <main>
@@ -26,18 +30,18 @@
       <div class="card">
         <h2>New meeting</h2>
         <div class="row">
-          <span class="hint">电源模式</span>
+          <span class="hint" data-i18n="电源模式">电源模式</span>
           <div class="seg" id="power-modes"></div>
-          <select id="power-batt-pref" class="compact" title="自动模式下，电池时采用哪个模式">
-            <option value="eco">电池时：省电优先</option>
-            <option value="defer">电池时：续航优先（排队）</option>
+          <select id="power-batt-pref" class="compact" title="自动模式下，电池时采用哪个模式" data-i18n-title="自动模式下，电池时采用哪个模式">
+            <option value="eco" data-i18n-value="电池时：省电优先">电池时：省电优先</option>
+            <option value="defer" data-i18n-value="电池时：续航优先（排队）">电池时：续航优先（排队）</option>
           </select>
         </div>
         <div id="power-status" class="status"></div>
         <div id="queue-box" class="queue-box" hidden>
           <div class="col-head">
-            <h3>排队中的会议</h3>
-            <button id="btn-queue-run" class="ghost">立即处理</button>
+            <h3 data-i18n="排队中的会议">排队中的会议</h3>
+            <button id="btn-queue-run" class="ghost" data-i18n="立即处理">立即处理</button>
           </div>
           <div id="queue-list" class="dirlist"></div>
         </div>
@@ -57,7 +61,7 @@
         <div id="record-status" class="status"></div>
         <div id="lifecycle-banner" class="banner" hidden>
           <span id="lifecycle-text"></span>
-          <button id="btn-keepalive" class="ghost">继续录音</button>
+          <button id="btn-keepalive" class="ghost" data-i18n="继续录音">继续录音</button>
         </div>
       </div>
 
@@ -71,27 +75,27 @@
         <div class="card-head">
           <h2>Notes</h2>
           <div class="row">
-            <select id="detail-level" class="compact" title="摘要详细程度">
-              <option value="brief">简要</option>
-              <option value="standard">标准</option>
-              <option value="detailed">详细</option>
+            <select id="detail-level" class="compact" title="摘要详细程度" data-i18n-title="摘要详细程度">
+              <option value="brief" data-i18n-value="简要">简要</option>
+              <option value="standard" data-i18n-value="标准">标准</option>
+              <option value="detailed" data-i18n-value="详细">详细</option>
             </select>
-            <button id="btn-regen" class="ghost">重新生成</button>
-            <button id="btn-open-dir" class="ghost">打开文件夹</button>
+            <button id="btn-regen" class="ghost" data-i18n="重新生成">重新生成</button>
+            <button id="btn-open-dir" class="ghost" data-i18n="打开文件夹">打开文件夹</button>
           </div>
         </div>
         <div id="regen-status" class="status"></div>
 
         <div id="speakers-block" class="speakers-block">
           <div class="col-head">
-            <h3>发言人 <span class="hint">（点 ▶ 试听 5 秒样本，输入框填名字，回车保存）</span></h3>
+            <h3><span data-i18n="发言人">发言人</span> <span class="hint" data-i18n="（点 ▶ 试听 5 秒样本，输入框填名字，回车保存）">（点 ▶ 试听 5 秒样本，输入框填名字，回车保存）</span></h3>
             <div class="row">
-              <button id="btn-diarize" class="ghost">识别发言人</button>
+              <button id="btn-diarize" class="ghost" data-i18n="识别发言人">识别发言人</button>
               <span id="diarize-status" class="status"></span>
             </div>
           </div>
           <div id="speaker-rows" class="speaker-rows">
-            <div class="hint">还没有识别发言人——点「识别发言人」按声音把他们分开（本地运行，首次会下载 27 MB 声纹模型）。</div>
+            <div class="hint" data-i18n="还没有识别发言人——点「识别发言人」按声音把他们分开（本地运行，首次会下载 27 MB 声纹模型）。">还没有识别发言人——点「识别发言人」按声音把他们分开（本地运行，首次会下载 27 MB 声纹模型）。</div>
           </div>
         </div>
 
@@ -100,19 +104,19 @@
             <div class="col-head">
               <h3>Notes <span id="notes-provider" class="badge"></span></h3>
               <div class="seg" id="notes-lang">
-                <button data-lang="zh" class="active">中文</button>
-                <button data-lang="orig">原文</button>
+                <button data-lang="zh" class="active" data-i18n="中文">中文</button>
+                <button data-lang="orig" data-i18n="原文">原文</button>
               </div>
             </div>
             <pre id="notes" class="markdown"></pre>
           </div>
           <div class="col">
             <div class="col-head">
-              <h3>Transcript <span class="hint">(点说话人标签改名)</span></h3>
+              <h3>Transcript <span class="hint" data-i18n="(点说话人标签改名)">(点说话人标签改名)</span></h3>
               <div class="seg" id="transcript-lang">
-                <button data-lang="orig" class="active">原文</button>
-                <button data-lang="zh">中文</button>
-                <button data-lang="both">双语</button>
+                <button data-lang="orig" class="active" data-i18n="原文">原文</button>
+                <button data-lang="zh" data-i18n="中文">中文</button>
+                <button data-lang="both" data-i18n="双语">双语</button>
               </div>
             </div>
             <div class="chunk-list" id="chunk-list"></div>
@@ -137,11 +141,11 @@
     <section id="panel-history" class="panel">
       <div class="card">
         <div class="card-head">
-          <h2>历史会议</h2>
-          <button id="btn-history-refresh" class="ghost">刷新</button>
+          <h2 data-i18n="历史会议">历史会议</h2>
+          <button id="btn-history-refresh" class="ghost" data-i18n="刷新">刷新</button>
         </div>
         <p class="hint">
-          打开以前录好的会议 —— 笔记、转写和 <b>发言人</b> 面板都会加载出来，可以对过去的会议逐个试听 5 秒样本、填上真实姓名。
+          <span data-i18n="打开以前录好的会议 —— 笔记、转写和">打开以前录好的会议 —— 笔记、转写和</span> <b data-i18n="发言人">发言人</b> <span data-i18n="面板都会加载出来，可以对过去的会议逐个试听 5 秒样本、填上真实姓名。">面板都会加载出来，可以对过去的会议逐个试听 5 秒样本、填上真实姓名。</span>
         </p>
         <div id="history-list" class="dirlist tall"></div>
         <div id="history-status" class="status"></div>
@@ -152,54 +156,54 @@
     <section id="panel-models" class="panel">
       <div class="card">
         <div class="card-head">
-          <h2>转写模型（Whisper）</h2>
+          <h2 data-i18n="转写模型（Whisper）">转写模型（Whisper）</h2>
           <span id="models-total" class="hint"></span>
         </div>
         <p class="hint">
-          首次使用某个档位会<b>自动下载</b>（带进度）。也可以在这里提前下载、切换档位，或删掉不再需要的以释放空间。
-          模型存在缓存目录里，拷到另一台机器即可离线使用。
+          <span data-i18n="首次使用某个档位会">首次使用某个档位会</span><b data-i18n="自动下载">自动下载</b><span data-i18n="（带进度）。也可以在这里提前下载、切换档位，或删掉不再需要的以释放空间。">（带进度）。也可以在这里提前下载、切换档位，或删掉不再需要的以释放空间。</span>
+          <span data-i18n="模型存在缓存目录里，拷到另一台机器即可离线使用。">模型存在缓存目录里，拷到另一台机器即可离线使用。</span>
         </p>
         <div id="whisper-rows" class="dirlist tall"></div>
       </div>
 
       <div class="card">
-        <h2>说话人识别模型</h2>
+        <h2 data-i18n="说话人识别模型">说话人识别模型</h2>
         <div id="speaker-model-rows" class="dirlist"></div>
       </div>
 
       <div class="card">
-        <h2>下载源与缓存</h2>
-        <label>模型下载地址（huggingface.co 不通时改成镜像）
+        <h2 data-i18n="下载源与缓存">下载源与缓存</h2>
+        <label><span data-i18n="模型下载地址（huggingface.co 不通时改成镜像）">模型下载地址（huggingface.co 不通时改成镜像）</span>
           <div class="row">
             <input type="text" id="cfg-model-endpoint" placeholder="https://huggingface.co/" />
-            <button id="btn-save-endpoint" class="ghost">保存</button>
-            <button id="btn-open-models" class="ghost">打开缓存目录</button>
+            <button id="btn-save-endpoint" class="ghost" data-i18n="保存">保存</button>
+            <button id="btn-open-models" class="ghost" data-i18n="打开缓存目录">打开缓存目录</button>
           </div>
         </label>
-        <label class="check"><input type="checkbox" id="cfg-auto-download" checked /> 缺模型时自动下载（关闭后缺模型会直接报错并说明）</label>
+        <label class="check"><input type="checkbox" id="cfg-auto-download" checked /> <span data-i18n="缺模型时自动下载（关闭后缺模型会直接报错并说明）">缺模型时自动下载（关闭后缺模型会直接报错并说明）</span></label>
         <div id="models-status" class="status"></div>
       </div>
 
       <div class="card">
-        <h2>笔记接口（LLM）</h2>
-        <p class="hint">用于「生成笔记」的模型接口；翻译引擎在 Settings 页单独配置。</p>
-        <label>常用提供方（选中会自动填地址与示例模型）
+        <h2 data-i18n="笔记接口（LLM）">笔记接口（LLM）</h2>
+        <p class="hint" data-i18n="用于「生成笔记」的模型接口；翻译引擎在 Settings 页单独配置。">用于「生成笔记」的模型接口；翻译引擎在 Settings 页单独配置。</p>
+        <label><span data-i18n="常用提供方（选中会自动填地址与示例模型）">常用提供方（选中会自动填地址与示例模型）</span>
           <select id="llm-preset"></select>
         </label>
         <div id="llm-preset-note" class="hint"></div>
-        <label>提供方类型
+        <label><span data-i18n="提供方类型">提供方类型</span>
           <select id="llm-provider">
-            <option value="ollama">Ollama（本地，推荐）</option>
-            <option value="openai">OpenAI 兼容接口</option>
+            <option value="ollama" data-i18n-value="Ollama（本地，推荐）">Ollama（本地，推荐）</option>
+            <option value="openai" data-i18n-value="OpenAI 兼容接口">OpenAI 兼容接口</option>
           </select>
         </label>
-        <label>接口地址 <input type="text" id="llm-baseurl" placeholder="http://127.0.0.1:11434" /></label>
-        <label>API Key（OpenAI 兼容时需要） <input type="password" id="llm-apikey" placeholder="sk-…" /></label>
-        <label>模型 <input type="text" id="llm-model" list="llm-model-suggest" placeholder="（留空 = 自动挑选）" /></label>
+        <label><span data-i18n="接口地址">接口地址</span> <input type="text" id="llm-baseurl" placeholder="http://127.0.0.1:11434" /></label>
+        <label><span data-i18n="API Key（OpenAI 兼容时需要）">API Key（OpenAI 兼容时需要）</span> <input type="password" id="llm-apikey" placeholder="sk-…" /></label>
+        <label><span data-i18n="模型">模型</span> <input type="text" id="llm-model" list="llm-model-suggest" placeholder="（留空 = 自动挑选）" data-i18n-placeholder="（留空 = 自动挑选）" /></label>
         <datalist id="llm-model-suggest"></datalist>
         <div class="controls">
-          <button id="btn-llm-test" class="ghost">测试连接</button>
-          <button id="btn-llm-save" class="primary">保存为笔记接口</button>
+          <button id="btn-llm-test" class="ghost" data-i18n="测试连接">测试连接</button>
+          <button id="btn-llm-save" class="primary" data-i18n="保存为笔记接口">保存为笔记接口</button>
         </div>
         <div id="llm-test-status" class="status"></div>
         <div id="llm-model-list" class="dirlist"></div>
@@ -232,11 +236,11 @@
             <option value="heuristic">Built-in extraction (no LLM)</option>
           </select>
         </label>
-        <label>摘要详细程度（默认档）
+        <label><span data-i18n="摘要详细程度（默认档）">摘要详细程度（默认档）</span>
           <select id="cfg-detail">
-            <option value="brief">简要</option>
-            <option value="standard">标准</option>
-            <option value="detailed">详细</option>
+            <option value="brief" data-i18n-value="简要">简要</option>
+            <option value="standard" data-i18n-value="标准">标准</option>
+            <option value="detailed" data-i18n-value="详细">详细</option>
           </select>
         </label>
         <div id="ollama-settings">
@@ -244,12 +248,12 @@
             <input type="text" id="cfg-ollama-url" placeholder="http://127.0.0.1:11434" />
           </label>
           <label>Model <input type="text" id="cfg-ollama-model" placeholder="(auto-pick installed model)" /></label>
-          <label>已安装的模型
+          <label><span data-i18n="已安装的模型">已安装的模型</span>
             <select id="cfg-ollama-model-pick">
-              <option value="">（自动选择：优先文本模型，跳过视觉模型）</option>
+              <option value="" data-i18n-value="（自动选择：优先文本模型，跳过视觉模型）">（自动选择：优先文本模型，跳过视觉模型）</option>
             </select>
           </label>
-          <p class="hint">长会议会自动分段提炼再合并（map-reduce），不会像以前那样被截断。摘要失败时会**明确标注**为规则提取，不会伪装成摘要。</p>
+          <p class="hint" data-i18n="长会议会自动分段提炼再合并（map-reduce），不会像以前那样被截断。摘要失败时会**明确标注**为规则提取，不会伪装成摘要。">长会议会自动分段提炼再合并（map-reduce），不会像以前那样被截断。摘要失败时会**明确标注**为规则提取，不会伪装成摘要。</p>
         </div>
         <div id="openai-settings" hidden>
           <label>Base URL <input type="text" id="cfg-openai-url" placeholder="https://api.openai.com/v1" /></label>
@@ -259,17 +263,17 @@
       </div>
 
       <div class="card">
-        <h2>翻译（自动转成中文）</h2>
-        <label class="check"><input type="checkbox" id="cfg-translate-enabled" checked /> 笔记（摘要）自动翻译成中文（总开关）</label>
-        <label class="check"><input type="checkbox" id="cfg-translate-transcript" /> 翻译整篇转写稿（很慢：155 分钟的会议约需 90 分钟；只翻摘要约 4 分钟）</label>
+        <h2 data-i18n="翻译（自动转成中文）">翻译（自动转成中文）</h2>
+        <label class="check"><input type="checkbox" id="cfg-translate-enabled" checked /> <span data-i18n="笔记（摘要）自动翻译成中文（总开关）">笔记（摘要）自动翻译成中文（总开关）</span></label>
+        <label class="check"><input type="checkbox" id="cfg-translate-transcript" /> <span data-i18n="翻译整篇转写稿（很慢：155 分钟的会议约需 90 分钟；只翻摘要约 4 分钟）">翻译整篇转写稿（很慢：155 分钟的会议约需 90 分钟；只翻摘要约 4 分钟）</span></label>
         <p class="hint">
-          转写稿翻译默认<b>关闭</b>，因为它实测是整条流水线里最慢的一步：155 分钟的会议有 2663 段、约 13 万字符英文，产出约 9 万 token，受本机 16.5 token/s 的生成速度限制约需 <b>90 分钟</b>（加大批量没有用，瓶颈是生成速度）。只翻摘要约 <b>4 分钟</b>。
-          需要中文转写稿时再勾选它；不勾选时会议记录里的 <code>meta.json</code> 会写明 <code>translationSkipped: "transcript-disabled"</code>，并且流水线里会明确提示，不会默默跳过。
+          <span data-i18n="转写稿翻译默认">转写稿翻译默认</span><b data-i18n="关闭">关闭</b><span data-i18n="，因为它实测是整条流水线里最慢的一步：155 分钟的会议有 2663 段、约 13 万字符英文，产出约 9 万 token，受本机 16.5 token/s 的生成速度限制约需 ">，因为它实测是整条流水线里最慢的一步：155 分钟的会议有 2663 段、约 13 万字符英文，产出约 9 万 token，受本机 16.5 token/s 的生成速度限制约需 </span><b data-i18n="90 分钟">90 分钟</b><span data-i18n="（加大批量没有用，瓶颈是生成速度）。只翻摘要约 ">（加大批量没有用，瓶颈是生成速度）。只翻摘要约 </span><b data-i18n="4 分钟">4 分钟</b><span data-i18n="。">。</span>
+          <span data-i18n="需要中文转写稿时再勾选它；不勾选时会议记录里的">需要中文转写稿时再勾选它；不勾选时会议记录里的</span> <code>meta.json</code> <span data-i18n="会写明">会写明</span> <code>translationSkipped: "transcript-disabled"</code><span data-i18n="，并且流水线里会明确提示，不会默默跳过。">，并且流水线里会明确提示，不会默默跳过。</span>
         </p>
-        <label>翻译引擎
+        <label><span data-i18n="翻译引擎">翻译引擎</span>
           <select id="cfg-translate-engine">
-            <option value="ollama">Ollama（本地）</option>
-            <option value="openai">OpenAI 兼容接口</option>
+            <option value="ollama" data-i18n-value="Ollama（本地）">Ollama（本地）</option>
+            <option value="openai" data-i18n-value="OpenAI 兼容接口">OpenAI 兼容接口</option>
           </select>
         </label>
         <div id="trans-ollama-settings">
@@ -286,59 +290,59 @@
       </div>
 
       <div class="card">
-        <h2>音频归档</h2>
-        <label class="check"><input type="checkbox" id="cfg-archive-enabled" checked /> 转写完成后自动压缩音频（原始 WAV 在校验通过后才会删除）</label>
-        <label>压缩档位
+        <h2 data-i18n="音频归档">音频归档</h2>
+        <label class="check"><input type="checkbox" id="cfg-archive-enabled" checked /> <span data-i18n="转写完成后自动压缩音频（原始 WAV 在校验通过后才会删除）">转写完成后自动压缩音频（原始 WAV 在校验通过后才会删除）</span></label>
+        <label><span data-i18n="压缩档位">压缩档位</span>
           <select id="cfg-archive-preset"></select>
         </label>
-        <label class="check"><input type="checkbox" id="cfg-archive-keepwav" /> 保留原始 WAV（压缩但不再省空间）</label>
-        <p class="hint">⚠️ 勾选后压缩不省空间：一条 155 分钟、16 kHz 单声道的录音约 <b>298 MB</b>，Opus 32 kbps 压缩副本约 <b>37 MB</b>。只在需要留原始 WAV 时勾选。</p>
+        <label class="check"><input type="checkbox" id="cfg-archive-keepwav" /> <span data-i18n="保留原始 WAV（压缩但不再省空间）">保留原始 WAV（压缩但不再省空间）</span></label>
+        <p class="hint"><span data-i18n="⚠️ 勾选后压缩不省空间：一条 155 分钟、16 kHz 单声道的录音约">⚠️ 勾选后压缩不省空间：一条 155 分钟、16 kHz 单声道的录音约</span> <b>298 MB</b><span data-i18n="，Opus 32 kbps 压缩副本约">，Opus 32 kbps 压缩副本约</span> <b>37 MB</b><span data-i18n="。只在需要留原始 WAV 时勾选。">。只在需要留原始 WAV 时勾选。</span></p>
         <p class="hint">
-          音频统一转成 <b>16 kHz 单声道</b>——采样率与声道数正合 Whisper 输入，这部分不损失任何东西；
-          但编码是有损的，实测（120 秒真实语音 + base 模型）<b>16 / 24 kbps 会整句丢失并改错人名</b>，
-          故默认 <b>Opus 32 kbps ≈ 14.4 MB/小时</b>（采集 WAV 约 691 MB/小时）。
-          同等语音质量下 Opus 比 MP3 小约 3 倍；只有需要把录音丢给老软件时才建议选 MP3。
-          删除前会做四重校验（编码成功 + 体积正常 + 二次解码通过 + 时长一致），任何一步失败都保留原文件。
+          <span data-i18n="音频统一转成 ">音频统一转成 </span><b data-i18n="16 kHz 单声道">16 kHz 单声道</b><span data-i18n="——采样率与声道数正合 Whisper 输入，这部分不损失任何东西；">——采样率与声道数正合 Whisper 输入，这部分不损失任何东西；</span>
+          <span data-i18n="但编码是有损的，实测（120 秒真实语音 + base 模型）">但编码是有损的，实测（120 秒真实语音 + base 模型）</span><b data-i18n="16 / 24 kbps 会整句丢失并改错人名">16 / 24 kbps 会整句丢失并改错人名</b><span data-i18n="，故默认 ">，故默认 </span>
+          <b data-i18n="Opus 32 kbps ≈ 14.4 MB/小时">Opus 32 kbps ≈ 14.4 MB/小时</b><span data-i18n="（采集 WAV 约 691 MB/小时）。">（采集 WAV 约 691 MB/小时）。</span>
+          <span data-i18n="同等语音质量下 Opus 比 MP3 小约 3 倍；只有需要把录音丢给老软件时才建议选 MP3。">同等语音质量下 Opus 比 MP3 小约 3 倍；只有需要把录音丢给老软件时才建议选 MP3。</span>
+          <span data-i18n="删除前会做四重校验（编码成功 + 体积正常 + 二次解码通过 + 时长一致），任何一步失败都保留原文件。">删除前会做四重校验（编码成功 + 体积正常 + 二次解码通过 + 时长一致），任何一步失败都保留原文件。</span>
         </p>
 
-        <h3>压缩已有会议音频</h3>
+        <h3 data-i18n="压缩已有会议音频">压缩已有会议音频</h3>
         <div class="controls">
-          <button id="btn-archive-scan" class="ghost">扫描可回收空间</button>
-          <button id="btn-archive-run" class="primary" disabled>开始压缩并删除 WAV</button>
+          <button id="btn-archive-scan" class="ghost" data-i18n="扫描可回收空间">扫描可回收空间</button>
+          <button id="btn-archive-run" class="primary" disabled data-i18n="开始压缩并删除 WAV">开始压缩并删除 WAV</button>
         </div>
         <div id="archive-scan-status" class="status"></div>
         <div id="archive-dirlist" class="dirlist"></div>
       </div>
 
       <div class="card">
-        <h2>生命周期与后台</h2>
-        <label class="check"><input type="checkbox" id="cfg-notify-done" checked /> 笔记生成完成后弹通知（点击打开会议文件夹）</label>
-        <label>空闲多久后自动退出
+        <h2 data-i18n="生命周期与后台">生命周期与后台</h2>
+        <label class="check"><input type="checkbox" id="cfg-notify-done" checked /> <span data-i18n="笔记生成完成后弹通知（点击打开会议文件夹）">笔记生成完成后弹通知（点击打开会议文件夹）</span></label>
+        <label><span data-i18n="空闲多久后自动退出">空闲多久后自动退出</span>
           <select id="cfg-autoquit">
-            <option value="0">处理完立即退出</option>
-            <option value="5">5 分钟</option>
-            <option value="15">15 分钟</option>
-            <option value="30">30 分钟</option>
-            <option value="-1">从不自动退出</option>
+            <option value="0" data-i18n-value="处理完立即退出">处理完立即退出</option>
+            <option value="5" data-i18n-value="5 分钟">5 分钟</option>
+            <option value="15" data-i18n-value="15 分钟">15 分钟</option>
+            <option value="30" data-i18n-value="30 分钟">30 分钟</option>
+            <option value="-1" data-i18n-value="从不自动退出">从不自动退出</option>
           </select>
         </label>
-        <label class="check"><input type="checkbox" id="cfg-confirm-busy" checked /> 正在录音/处理时关闭窗口要先确认（防止误关丢掉整场会议的处理）</label>
-        <label class="check"><input type="checkbox" id="cfg-autostop" checked /> 长时间无人声时自动停止录音（防"忘了按停止"）</label>
+        <label class="check"><input type="checkbox" id="cfg-confirm-busy" checked /> <span data-i18n="正在录音/处理时关闭窗口要先确认（防止误关丢掉整场会议的处理）">正在录音/处理时关闭窗口要先确认（防止误关丢掉整场会议的处理）</span></label>
+        <label class="check"><input type="checkbox" id="cfg-autostop" checked /> <span data-i18n="长时间无人声时自动停止录音（防&quot;忘了按停止&quot;）">长时间无人声时自动停止录音（防"忘了按停止"）</span></label>
         <div class="row">
-          <label>无声多少分钟后提醒 <input type="number" id="cfg-silence-min" min="1" max="180" step="1" /></label>
-          <label>提醒后多少分钟强制停止 <input type="number" id="cfg-forcestop-min" min="1" max="60" step="1" /></label>
-          <label>磁盘剩余低于 (GB) 就停止 <input type="number" id="cfg-mindisk-gb" min="0" max="200" step="1" /></label>
+          <label><span data-i18n="无声多少分钟后提醒">无声多少分钟后提醒</span> <input type="number" id="cfg-silence-min" min="1" max="180" step="1" /></label>
+          <label><span data-i18n="提醒后多少分钟强制停止">提醒后多少分钟强制停止</span> <input type="number" id="cfg-forcestop-min" min="1" max="60" step="1" /></label>
+          <label><span data-i18n="磁盘剩余低于 (GB) 就停止">磁盘剩余低于 (GB) 就停止</span> <input type="number" id="cfg-mindisk-gb" min="0" max="200" step="1" /></label>
         </div>
         <p class="hint">
-          自动停止前会先弹系统通知，并在录音面板显示倒计时，你可以点「继续录音」取消。
-          录音期间以约 1.5 GB/小时写盘，所以磁盘保护是默认开启的。
+          <span data-i18n="自动停止前会先弹系统通知，并在录音面板显示倒计时，你可以点「继续录音」取消。">自动停止前会先弹系统通知，并在录音面板显示倒计时，你可以点「继续录音」取消。</span>
+          <span data-i18n="录音期间以约 1.5 GB/小时写盘，所以磁盘保护是默认开启的。">录音期间以约 1.5 GB/小时写盘，所以磁盘保护是默认开启的。</span>
         </p>
 
-        <h3>会议软件检测（WASAPI 音频会话）</h3>
-        <label class="check"><input type="checkbox" id="cfg-meetdetect" checked /> 检测会议软件的音频会话（本地实现，不联网、不读窗口内容）</label>
-        <label class="check"><input type="checkbox" id="cfg-meetdetect-stop" checked /> 会议软件停止播放声音后，自动停止录音并出笔记</label>
-        <label class="check"><input type="checkbox" id="cfg-meetdetect-start" /> 会议软件开始播放声音时，自动开始录音（涉及隐私，默认关闭）</label>
-        <label>监控的进程名（逗号分隔） <input type="text" id="cfg-meetdetect-apps" placeholder="ms-teams.exe, zoom.exe, …" /></label>
+        <h3 data-i18n="会议软件检测（WASAPI 音频会话）">会议软件检测（WASAPI 音频会话）</h3>
+        <label class="check"><input type="checkbox" id="cfg-meetdetect" checked /> <span data-i18n="检测会议软件的音频会话（本地实现，不联网、不读窗口内容）">检测会议软件的音频会话（本地实现，不联网、不读窗口内容）</span></label>
+        <label class="check"><input type="checkbox" id="cfg-meetdetect-stop" checked /> <span data-i18n="会议软件停止播放声音后，自动停止录音并出笔记">会议软件停止播放声音后，自动停止录音并出笔记</span></label>
+        <label class="check"><input type="checkbox" id="cfg-meetdetect-start" /> <span data-i18n="会议软件开始播放声音时，自动开始录音（涉及隐私，默认关闭）">会议软件开始播放声音时，自动开始录音（涉及隐私，默认关闭）</span></label>
+        <label><span data-i18n="监控的进程名（逗号分隔）">监控的进程名（逗号分隔）</span> <input type="text" id="cfg-meetdetect-apps" placeholder="ms-teams.exe, zoom.exe, …" /></label>
         <div id="meetdetect-status" class="status"></div>
       </div>
 
@@ -360,20 +364,22 @@
        故意没有「取消」——录音不能悄悄丢掉名单，结局只有「保存」或「维持原样」。 -->
   <div id="participants-overlay" class="participants-overlay" hidden>
     <div class="card participants-card">
-      <h2 id="participants-title">参会人</h2>
+      <h2 id="participants-title" data-i18n="参会人">参会人</h2>
       <p class="hint" id="participants-note"></p>
       <div id="participants-rows" class="participants-rows"></div>
-      <button id="participants-add" class="ghost">添加一位</button>
+      <button id="participants-add" class="ghost" data-i18n="添加一位">添加一位</button>
       <div class="row participants-actions">
-        <label class="check"><input type="checkbox" id="participants-noask" /> 以后停止时不要再问我</label>
+        <label class="check"><input type="checkbox" id="participants-noask" /> <span data-i18n="以后停止时不要再问我">以后停止时不要再问我</span></label>
       </div>
       <div class="row participants-actions">
-        <button id="participants-save" class="primary">保存</button>
-        <button id="participants-unchanged" class="ghost">不需要更改参会人</button>
+        <button id="participants-save" class="primary" data-i18n="保存">保存</button>
+        <button id="participants-unchanged" class="ghost" data-i18n="不需要更改参会人">不需要更改参会人</button>
       </div>
     </div>
   </div>
 
+  <script src="i18n.js"></script>
+  <script src="trackQuality.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

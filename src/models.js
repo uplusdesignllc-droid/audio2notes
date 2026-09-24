@@ -115,14 +115,21 @@ function deleteWhisper(cacheDir, model) {
 
 function voiceprintStatus(cacheDir) {
   const st = diarize.modelsStatus(cacheDir);
+  // `path` stays the PER-USER download location: the Settings card's 下载/删除 act on
+  // it. `bundled`/`source` say whether a usable model ships with the app, and
+  // `bytes` reports the copy that would actually be loaded.
   let bytes = 0;
-  try { bytes = fs.statSync(st.embedding.path).size; } catch { /* missing */ }
+  try { bytes = fs.statSync(st.embedding.resolvedPath).size; } catch { /* missing */ }
   return {
     id: diarize.EMBEDDING_MODEL,
-    ready: st.embedding.ready,
+    ready: st.embedding.ready,                  // usable from EITHER source
+    downloaded: st.embedding.downloaded,        // present in the per-user cache
+    source: st.embedding.source,                // "downloaded" | "bundled" | null
+    bundled: st.embedding.bundled,
     bytes,
     approxMB: 28,
     path: st.embedding.path,
+    resolvedPath: st.embedding.resolvedPath,
     url: diarize.EMBEDDING_URL,
   };
 }
@@ -141,8 +148,16 @@ async function downloadVoiceprint({ cacheDir, onProgress }) {
   return voiceprintStatus(cacheDir);
 }
 
+/**
+ * Delete the PER-USER voiceprint cache only.
+ *
+ * Uses the unresolved cache path on purpose: resolution now falls back to the model
+ * BUNDLED inside the app, so deleting the resolved path would try to remove the
+ * shipped copy (and in a packaged build, a file inside app.asar.unpacked). Removing
+ * the user cache is correct — the bundled fallback keeps speaker recognition working.
+ */
 function deleteVoiceprint(cacheDir) {
-  const p = voiceprintStatus(cacheDir).path;
+  const p = diarize.embeddingModelPath(cacheDir);
   try {
     fs.rmSync(p, { force: true });
     return { ok: true, removed: p };

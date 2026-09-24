@@ -273,10 +273,44 @@ async function getPipeline(model, cacheDir, onProgress, endpoint) {
  * @returns {Promise<{text:string, chunks:Array, audio:object, silenceSkippedSec:number,
  *   speechKeptSec:number, totalSec:number, segments:number}>}
  */
-async function transcribeFile({ wavFile, model, cacheDir, onProgress, onPartial, endpoint, silenceSkip = true }) {
-  const rawFile = path.join(os.tmpdir(), `a2n-raw-${process.pid}-${Date.now()}.raw`);
-  const bytes = await decodeToRaw16k(wavFile, rawFile);
-  try { fs.rmSync(rawFile, { force: true }); } catch { /* ignore */ }
+async function transcribeFile({ wavFile, model, cacheDir, onProgress, onPartial, endpoint, silenceSkip = true, tempDir }) {
+  /* Decode to a raw PCM temp file, then read it back.
+   *
+   * WHY THE FALLBACK: on one machine this step failed with `ffmpeg exit -13`
+   * (EACCES, permission denied) and killed the whole pipeline AFTER mixing had
+   * succeeded — the meeting folder held only the raw .wav files, with no transcript
+   * and no notes. A ~40 MB file written into the system temp directory is exactly the
+   * kind of artifact a security agent may block or quarantine mid-write, and the
+   * failure is transient. So: try the caller's preferred directory (default the
+   * system temp), and on any failure retry ONCE beside the meeting audio, which is a
+   * directory the app provably can write (it just wrote the .wav there). If both
+   * fail, report BOTH paths so the cause is diagnosable instead of a bare exit code.
+   */
+  const primaryDir = tempDir || os.tmpdir();
+  const tryDecode = async (dir) => {
+    const rawFile = path.join(dir, `a2n-raw-${process.pid}-${Date.now()}.raw`);
+    const bytes = await decodeToRaw16k(wavFile, rawFile);
+    try { fs.rmSync(rawFile, { force: true }); } catch { /* ignore */ }
+    return bytes;
+  };
+
+  let bytes;
+  try {
+    bytes = await tryDecode(primaryDir);
+  } catch (e) {
+    const fallbackDir = path.dirname(wavFile);
+    if (fallbackDir && fallbackDir !== primaryDir) {
+      console.warn(`[transcribe] decode failed in ${primaryDir} (${e.message}) - retrying in ${fallbackDir}`);
+      if (onProgress) onProgress({ status: "progress", message: `Retrying decode outside the temp directory…` });
+      try {
+        bytes = await tryDecode(fallbackDir);
+      } catch (e2) {
+        throw new Error(`ffmpeg could not decode the audio: ${e.message} in ${primaryDir}, then ${e2.message} in ${fallbackDir}`);
+      }
+    } else {
+      throw e;
+    }
+  }
   const pcm = new Float32Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 4));
 
   const totalSec = pcm.length / SAMPLE_RATE;
@@ -353,9 +387,25 @@ async function transcribeFile({ wavFile, model, cacheDir, onProgress, onPartial,
    * reported, logged, and handed to the caller for the meeting record. */
   const silenceSkippedSec = analysis ? analysis.silenceSkippedSec : 0;
   const keptTotalSec = analysis ? analysis.speechKeptSec : totalSec;
+  /* Overall level of the track, for the "did this even record anything?" question.
+   * A microphone that captured nothing is otherwise invisible: the pipeline succeeds,
+   * only the system track transcribes, and the user finds out afterwards. These two
+   * numbers make that visible in meta.json.
+   *   peakDbfs      - loudest sample; <= -90 dBFS means digital silence
+   *   activePercent - share of samples above a digital-silence floor
+   * Measured over the WHOLE decoded PCM, before any silence skipping. */
+  let peakAbs = 0;
+  let activeCount = 0;
+  for (let i = 0; i < pcm.length; i++) {
+    const a = Math.abs(pcm[i]);
+    if (a > peakAbs) peakAbs = a;
+    if (a > 1e-6) activeCount++;
+  }
   const audio = {
     track: path.basename(wavFile),
     totalSec: round1(totalSec),
+    peakDbfs: round1(peakAbs > 0 ? 20 * Math.log10(peakAbs) : -Infinity),
+    activePercent: round1(pcm.length ? (activeCount / pcm.length) * 100 : 0),
     refDbfs: round1(analysis ? analysis.refDbfs : NaN),
     refBasis: analysis ? analysis.refBasis : "silence-skip-off",
     thresholdDbfs: round1(analysis ? analysis.thresholdDbfs : NaN),

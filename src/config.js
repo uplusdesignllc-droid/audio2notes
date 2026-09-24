@@ -4,6 +4,14 @@ const path = require("path");
 const { app } = require("electron");
 
 const DEFAULTS = {
+  /* Renderer UI language. Read by renderer/app.js at boot and written by the
+   * #ui-lang control in the top nav. English is the default by product decision
+   * (2026-09-22); "zh" keeps the original Chinese chrome. Only the UI chrome is
+   * affected — the language of the NOTES is a separate setting
+   * (translation.enabled) and the two must not be conflated. */
+  ui: {
+    lang: "en",               // en | zh
+  },
   meetingsDir: "",            // empty => <userData>/meetings
   capture: { system: true, mic: true },
   /* Silero VAD, SHADOW ONLY (src/liveVad.js).
@@ -61,6 +69,9 @@ const DEFAULTS = {
   participants: {
     askOnStop: true,     // show the participant roster modal when a recording stops
     timeoutMs: 300000,   // how long notes generation waits for an answer (5 min)
+  },
+  diarize: {
+    autoRun: true,   // run speaker recognition automatically at the end of the pipeline
   },
   lifecycle: {
     notifyOnDone: true,       // desktop notification when the notes are ready

@@ -1,12 +1,17 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 
+/* Translation alias for i18n.js. It is loaded before this file; if it ever is
+ * not, this degrades to the Chinese source string instead of throwing. */
+const T = (key, vars) => (window.I18N && window.I18N.t ? window.I18N.t(key, vars) : key);
+
 let cfg = null;
 let recording = false;
 let timerInt = null;
 let t0 = 0;
 let currentDir = null;
 let lastResult = null; // { notes, notesZh, chunks }
+let lastPipeline = ""; // last raw pipeline message from the backend (translated for display)
 let meetingParticipants = []; // roster of the open meeting — rename suggestions only (diarization order != roster order, never auto-assign)
 
 /* ---- tabs ---- */
@@ -49,14 +54,14 @@ async function loadArchivePresets() {
   }
   if (!list.length) {
     console.error("archivePresets returned nothing — falling back to the built-in default");
-    list = [{ id: "opus-32", label: "Opus 32 kbps 单声道（推荐）", codec: "libopus", bitrateKbps: 32, bytesPerHour: 14400000 }];
+    list = [{ id: "opus-32", label: T("Opus 32 kbps 单声道（推荐）"), codec: "libopus", bitrateKbps: 32, bytesPerHour: 14400000 }];
   }
   ARCHIVE_PRESETS = list;
   archiveSel.innerHTML = "";
   for (const p of list) {
     const o = document.createElement("option");
     o.value = p.id;
-    o.textContent = `${p.label} — 约 ${(p.bytesPerHour / 1e6).toFixed(1)} MB/小时`;
+    o.textContent = T("${…} — 约 ${…} MB/小时", { "${…1}": p.label, "${…2}": (p.bytesPerHour / 1e6).toFixed(1) });
     archiveSel.appendChild(o);
   }
 }
@@ -81,23 +86,23 @@ async function loadOllamaModels() {
   try {
     const r = await window.a2n.notesModels();
     if (!r || r.error) {
-      sel.innerHTML = `<option value="">（读取失败：${esc((r && r.error) || "unknown")}）</option>`;
+      sel.innerHTML = T("<option value=\"\">（读取失败：${…}）</option>", { "${…1}": esc((r && r.error) || "unknown") });
       return;
     }
     const cur = ($("cfg-ollama-model").value || "").trim();
-    sel.innerHTML = '<option value="">（自动选择：优先文本模型，跳过视觉模型）</option>';
+    sel.innerHTML = T('<option value="">（自动选择：优先文本模型，跳过视觉模型）</option>');
     for (const m of r.models || []) {
       const o = document.createElement("option");
       o.value = m.name;
       const tags = [];
-      if (m.name === r.recommended) tags.push("推荐");
-      if (m.vlm) tags.push("视觉模型，摘要质量通常更差");
+      if (m.name === r.recommended) tags.push(T("推荐"));
+      if (m.vlm) tags.push(T("视觉模型，摘要质量通常更差"));
       o.textContent = m.name + (m.paramSize ? ` · ${m.paramSize}` : "") + (tags.length ? `（${tags.join("，")}）` : "");
       sel.appendChild(o);
     }
     if (cur) sel.value = cur;
   } catch (e) {
-    sel.innerHTML = `<option value="">（读取失败：${e.message}）</option>`;
+    sel.innerHTML = T("<option value=\"\">（读取失败：${…}）</option>", { "${…1}": e.message });
   }
 }
 
@@ -246,28 +251,26 @@ function fmtBytes(n) {
 $("btn-archive-scan").addEventListener("click", async () => {
   const btn = $("btn-archive-scan");
   btn.disabled = true;
-  $("archive-scan-status").textContent = "扫描中…";
+  $("archive-scan-status").textContent = T("扫描中…");
   $("archive-dirlist").innerHTML = "";
   try {
     const s = await window.a2n.archiveScan();
     if (!s || s.error) {
-      $("archive-scan-status").textContent = "扫描失败：" + ((s && s.error) || "unknown");
+      $("archive-scan-status").textContent = T("扫描失败：") + ((s && s.error) || "unknown");
       return;
     }
     if (!s.fileCount) {
-      $("archive-scan-status").textContent = "没有找到 WAV 文件（可能已经压缩过了）。";
+      $("archive-scan-status").textContent = T("没有找到 WAV 文件（可能已经压缩过了）。");
       return;
     }
     $("archive-scan-status").textContent =
-      `${s.fileCount} 个 WAV · ${fmtBytes(s.totalBytes)} → 预计 ${fmtBytes(s.estimatedBytesAfter)}` +
-      `（可回收 ${fmtBytes(s.estimatedSavedBytes)}，按 ${s.preset.label}）`;
+      T("${…} 个 WAV · ${…} → 预计 ${…}", { "${…1}": s.fileCount, "${…2}": fmtBytes(s.totalBytes), "${…3}": fmtBytes(s.estimatedBytesAfter) }) +
+      T("（可回收 ${…}，按 ${…}）", { "${…1}": fmtBytes(s.estimatedSavedBytes), "${…2}": s.preset.label });
     const rows = s.dirs
       .sort((a, b) => b.totalBytes - a.totalBytes)
       .map(
         (d) =>
-          `<div class="dirrow"><span>${esc(d.name)}</span><span>${d.files.length} 个 · ${fmtBytes(d.totalBytes)} → ${fmtBytes(
-            d.estimatedBytesAfter
-          )}</span></div>`
+          T("<div class=\"dirrow\"><span>${…}</span><span>${…} 个 · ${…} → ${…}</span></div>", { "${…1}": esc(d.name), "${…2}": d.files.length, "${…3}": fmtBytes(d.totalBytes), "${…4}": fmtBytes( d.estimatedBytesAfter ) })
       );
     $("archive-dirlist").innerHTML = rows.join("");
     $("btn-archive-run").disabled = false;
@@ -278,32 +281,30 @@ $("btn-archive-scan").addEventListener("click", async () => {
 
 $("btn-archive-run").addEventListener("click", async () => {
   const ok = confirm(
-    "将把会议目录里的 WAV 转成压缩音频，并在校验通过后删除原始 WAV。\n" +
-      "此操作对原始 WAV 不可撤销（转写结果 unaffected）。确定继续？"
+    T("将把会议目录里的 WAV 转成压缩音频，并在校验通过后删除原始 WAV。") + "\n" +
+      T("此操作对原始 WAV 不可撤销（转写结果 unaffected）。确定继续？")
   );
   if (!ok) return;
   const btn = $("btn-archive-run");
   btn.disabled = true;
   $("btn-archive-scan").disabled = true;
-  $("archive-scan-status").textContent = "压缩中…";
+  $("archive-scan-status").textContent = T("压缩中…");
   try {
     const r = await window.a2n.archiveRun();
     if (!r || r.error) {
-      $("archive-scan-status").textContent = "失败：" + ((r && r.error) || "unknown");
+      $("archive-scan-status").textContent = T("失败：") + ((r && r.error) || "unknown");
       return;
     }
     const fail = (r.errors || []).length;
     $("archive-scan-status").textContent =
-      `已完成 ✓ 压缩 ${r.files.length} 个文件，回收 ${fmtBytes(r.savedBytes)}` +
+      T("已完成 ✓ 压缩 ${…} 个文件，回收 ${…}", { "${…1}": r.files.length, "${…2}": fmtBytes(r.savedBytes) }) +
       `（${fmtBytes(r.before)} → ${fmtBytes(r.after)}）` +
-      (fail ? ` · ${fail} 个失败（原文件已保留）` : "");
+      (fail ? T(" · ${…} 个失败（原文件已保留）", { "${…1}": fail }) : "");
     const rows = (r.dirs || [])
       .filter((d) => d.files.length || d.errors.length)
       .map(
         (d) =>
-          `<div class="dirrow"><span>${esc(d.name)}</span><span>${d.files.length} 个 · 回收 ${fmtBytes(
-            d.savedBytes
-          )}${d.errors.length ? ` · ${d.errors.length} 失败` : ""}</span></div>`
+          T("<div class=\"dirrow\"><span>${…}</span><span>${…} 个 · 回收 ${…}${…}</span></div>", { "${…1}": esc(d.name), "${…2}": d.files.length, "${…3}": fmtBytes( d.savedBytes ), "${…4}": d.errors.length ? T(" · ${…} 失败", { "${…1}": d.errors.length }) : "" })
       );
     $("archive-dirlist").innerHTML = rows.join("");
     $("btn-archive-run").disabled = true; // re-scan before running again
@@ -313,7 +314,7 @@ $("btn-archive-run").addEventListener("click", async () => {
 });
 
 window.a2n.onArchive((p) => {
-  $("archive-scan-status").textContent = p.message || "压缩中…";
+  $("archive-scan-status").textContent = p.message || T("压缩中…");
 });
 
 $("btn-choose-dir").addEventListener("click", async () => {
@@ -357,7 +358,7 @@ async function startRecording(autoApp) {
   $("btn-record").disabled = true;
   $("btn-stop").disabled = false;
   $("record-status").textContent = autoApp
-    ? `● 检测到 ${autoApp} 在播放声音，已自动开始录音…`
+    ? T("● 检测到 ${…} 在播放声音，已自动开始录音…", { "${…1}": autoApp })
     : "Recording… (file: " + res.dir + ")";
   $("pipeline").textContent = "Recording in progress…";
   setProgress(0);
@@ -366,6 +367,43 @@ async function startRecording(autoApp) {
     const s = Math.floor((Date.now() - t0) / 1000);
     $("timer").textContent = `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
   }, 500);
+  startMicWatchdog();
+}
+
+/* ---- microphone silence watchdog ----------------------------------------
+ * WHY: the app records whatever Windows has as the default input device, and if that
+ * device is muted — a USB headset's hardware switch, another app holding it
+ * exclusively — the recording is pure silence with NO error anywhere. Observed on this
+ * machine: a 10-minute meeting whose mic track was 0.7 % active, discovered only
+ * afterwards. The level meter was already on screen; nothing acted on it.
+ *
+ * A pause in speech must NOT trigger this, so it looks for "never once got above the
+ * noise floor" over a sustained window rather than "silent right now". The rule itself
+ * lives in renderer/trackQuality.js so it is unit-testable without a DOM. */
+const TQ = window.trackQuality || { MIC_WATCHDOG_WINDOW_SEC: 10, MIC_LEVEL_FLOOR: 8, micLooksDead: () => false, isSilentTrack: () => false, pickableNames: () => [] };
+const MIC_WATCHDOG_WINDOW = TQ.MIC_WATCHDOG_WINDOW_SEC;
+const MIC_LEVEL_FLOOR = TQ.MIC_LEVEL_FLOOR;
+let micWatchTimer = null;
+let micLoudSamples = 0;
+let micTotalSamples = 0;
+
+function stopMicWatchdog() {
+  if (micWatchTimer) { clearInterval(micWatchTimer); micWatchTimer = null; }
+}
+
+function startMicWatchdog() {
+  stopMicWatchdog();
+  micLoudSamples = 0;
+  micTotalSamples = 0;
+  micWatchTimer = setInterval(() => {
+    if (!recording) { stopMicWatchdog(); return; }
+    if (!TQ.micLooksDead(micTotalSamples, micLoudSamples)) return;
+    const note = T("⚠️ 麦克风一直没有声音——检查默认输入设备或耳机上的静音开关");
+    if (!$("record-status").textContent.includes(note)) {
+      $("record-status").textContent += " · " + note;
+    }
+    stopMicWatchdog(); // report once; a persistent nag would be worse than useless
+  }, 1000);
 }
 
 $("btn-record").addEventListener("click", () => startRecording(null));
@@ -378,7 +416,7 @@ if (window.a2n.onMeeting) {
       if (!recording) startRecording(e.app);
     } else if (e.type === "auto-stop-request") {
       if (recording) {
-        $("pipeline").textContent = "会议软件已停止播放声音，自动停止录音…";
+        $("pipeline").textContent = T("会议软件已停止播放声音，自动停止录音…");
         stopAndProcess("meeting-app");
       }
     }
@@ -391,15 +429,16 @@ async function stopAndProcess(reason) {
   $("btn-stop").disabled = true;
   $("btn-record").disabled = true;
   $("record-status").textContent =
-    reason === "silence" ? "长时间无人声，自动停止并处理…"
-    : reason === "disk" ? "磁盘空间不足，自动停止并处理…"
-    : reason === "meeting-app" ? "会议软件已停止播放声音，自动停止并处理…"
+    reason === "silence" ? T("长时间无人声，自动停止并处理…")
+    : reason === "disk" ? T("磁盘空间不足，自动停止并处理…")
+    : reason === "meeting-app" ? T("会议软件已停止播放声音，自动停止并处理…")
     : "Stopping…";
   $("pipeline").textContent = "Finalizing recording…";
   hideLifecycleBanner();
   const res = await window.a2n.stopRecord(reason); // forward the stop reason verbatim (main maps anything unrecognized itself)
   clearInterval(timerInt);
   recording = false;
+  stopMicWatchdog(); // no watchdog may outlive the recording
   $("btn-record").disabled = false;
   if (res.error) {
     $("record-status").textContent = "Error: " + res.error;
@@ -409,9 +448,9 @@ async function stopAndProcess(reason) {
   if (res.queued) {
     // defer mode: nothing was transcribed yet, the audio is compressed and queued
     currentDir = res.dir;
-    const saved = res.archive && res.archive.savedBytes ? `，音频已压缩回收 ${fmtBytes(res.archive.savedBytes)}` : "";
-    $("record-status").textContent = `⏸ 已排队（续航优先模式）${saved} —— 插电后自动转写，也可以点「立即处理」。`;
-    $("pipeline").textContent = "已排队，等待电源。";
+    const saved = res.archive && res.archive.savedBytes ? T("，音频已压缩回收 ${…}", { "${…1}": fmtBytes(res.archive.savedBytes) }) : "";
+    $("record-status").textContent = T("⏸ 已排队（续航优先模式）${…} —— 插电后自动转写，也可以点「立即处理」。", { "${…1}": saved });
+    $("pipeline").textContent = T("已排队，等待电源。");
     loadPower();
     window.a2n.lifecycleTouch();
     return;
@@ -419,10 +458,10 @@ async function stopAndProcess(reason) {
   $("record-status").textContent = "Done ✓ saved to " + res.dir;
   currentDir = res.dir;
   if (res.archive && res.archive.savedBytes) {
-    $("record-status").textContent += ` · 音频已压缩（${res.archive.bitrateKbps} kbps），回收 ${fmtBytes(res.archive.savedBytes)}`;
+    $("record-status").textContent += T(" · 音频已压缩（${…} kbps），回收 ${…}", { "${…1}": res.archive.bitrateKbps, "${…2}": fmtBytes(res.archive.savedBytes) });
   }
   if (res.archiveError) {
-    $("record-status").textContent += ` · ⚠️ 音频压缩失败：${res.archiveError}（原始 WAV 已保留）`;
+    $("record-status").textContent += T(" · ⚠️ 音频压缩失败：${…}（原始 WAV 已保留）", { "${…1}": res.archiveError });
   }
   showResult(res);
   window.a2n.lifecycleTouch();
@@ -474,7 +513,7 @@ function showSilenceCountdown(silentSec, forceInSec) {
   const paint = () => {
     const left = Math.max(0, Math.round((bannerDeadline - Date.now()) / 1000));
     $("lifecycle-text").textContent =
-      `已 ${mins} 分钟没有声音。${left} 秒后将自动停止并生成笔记（录音仍在继续）。`;
+      T("已 ${…} 分钟没有声音。${…} 秒后将自动停止并生成笔记（录音仍在继续）。", { "${…1}": mins, "${…2}": left });
   };
   b.hidden = false;
   paint();
@@ -490,12 +529,12 @@ if (window.a2n.onLifecycle) {
     } else if (e.type === "silence-cleared") {
       // keep the banner (and its keep-alive button), drop only the countdown
       stopSilenceCountdown();
-      showLifecycleBanner("声音已恢复，仍在监控。");
+      showLifecycleBanner(T("声音已恢复，仍在监控。"));
     } else if (e.type === "auto-stop-request" || e.type === "stop-request") {
       if (recording) stopAndProcess(e.reason);
     } else if (e.type === "disk-low") {
       stopSilenceCountdown();
-      showLifecycleBanner(`磁盘剩余 ${e.freeGB.toFixed(1)} GB（低于 ${e.limitGB} GB），已停止录音以免写满。`);
+      showLifecycleBanner(T("磁盘剩余 ${…} GB（低于 ${…} GB），已停止录音以免写满。", { "${…1}": e.freeGB.toFixed(1), "${…2}": e.limitGB }));
     }
   });
 }
@@ -506,8 +545,8 @@ if (keepAliveBtn) {
     await window.a2n.lifecycleKeepAlive();
     // do NOT hide the banner here: the button the user just pressed is inside it
     stopSilenceCountdown();
-    showLifecycleBanner("已取消本次自动停止，直到再次长时间无声。");
-    $("record-status").textContent = "继续录音（已取消自动停止，直到再次长时间无声）。";
+    showLifecycleBanner(T("已取消本次自动停止，直到再次长时间无声。"));
+    $("record-status").textContent = T("继续录音（已取消自动停止，直到再次长时间无声）。");
   });
 }
 
@@ -527,14 +566,12 @@ $("btn-pick").addEventListener("click", async () => {
   currentDir = res.dir;
   if (res.archive && res.archive.imported) {
     // the original file was never copied — do not imply that space was reclaimed
-    $("import-status").textContent += ` · 会议目录只存压缩副本（${fmtBytes(res.archive.archivedBytes)}），原文件仍在你原来的位置（${fmtBytes(
-      res.archive.sourceBytes
-    )}）`;
+    $("import-status").textContent += T(" · 会议目录只存压缩副本（${…}），原文件仍在你原来的位置（${…}）", { "${…1}": fmtBytes(res.archive.archivedBytes), "${…2}": fmtBytes( res.archive.sourceBytes ) });
   } else if (res.archive && res.archive.savedBytes) {
-    $("import-status").textContent += ` · 音频已压缩，回收 ${fmtBytes(res.archive.savedBytes)}`;
+    $("import-status").textContent += T(" · 音频已压缩，回收 ${…}", { "${…1}": fmtBytes(res.archive.savedBytes) });
   }
   if (res.archiveError) {
-    $("import-status").textContent += ` · ⚠️ 压缩副本生成失败：${res.archiveError}`;
+    $("import-status").textContent += T(" · ⚠️ 压缩副本生成失败：${…}", { "${…1}": res.archiveError });
   }
   showResult(res);
 });
@@ -547,11 +584,11 @@ async function refreshMeetingStatus() {
     const st = await window.a2n.meetingStatus();
     const n = (st.sessions || []).length;
     el.textContent = st.activeApp
-      ? `检测到 ${st.activeApp} 正在播放声音`
-      : `当前没有会议软件在播放声音（监听 ${n} 个音频会话）`;
+      ? T("检测到 ${…} 正在播放声音", { "${…1}": st.activeApp })
+      : T("当前没有会议软件在播放声音（监听 ${…} 个音频会话）", { "${…1}": n });
   } catch (e) {
     console.error("meetingStatus IPC failed:", e);
-    el.textContent = "会议软件检测不可用：" + e.message;
+    el.textContent = T("会议软件检测不可用：") + e.message;
   }
 }
 setInterval(refreshMeetingStatus, 20000);
@@ -560,15 +597,15 @@ setInterval(refreshMeetingStatus, 20000);
 async function loadHistory() {
   const box = $("history-list");
   if (!box) return;
-  box.innerHTML = '<div class="hint">读取中…</div>';
+  box.innerHTML = T('<div class="hint">读取中…</div>');
   try {
     const r = await window.a2n.meetingsList();
     if (!r || r.error) {
-      box.innerHTML = `<div class="hint">读取失败：${esc((r && r.error) || "unknown")}</div>`;
+      box.innerHTML = T("<div class=\"hint\">读取失败：${…}</div>", { "${…1}": esc((r && r.error) || "unknown") });
       return;
     }
     if (!r.items.length) {
-      box.innerHTML = '<div class="hint">还没有可打开的会议（录音或导入一次就会出现）。</div>';
+      box.innerHTML = T('<div class="hint">还没有可打开的会议（录音或导入一次就会出现）。</div>');
       return;
     }
     box.innerHTML = "";
@@ -579,39 +616,39 @@ async function loadHistory() {
       left.textContent = it.name;
       const right = document.createElement("span");
       const bits = [];
-      if (it.durationSec) bits.push(`${Math.round(it.durationSec / 60)} 分钟`);
-      if (it.hasSpeakers) bits.push("有发言人");
-      if (it.hasAudio) bits.push("音频可试听");
+      if (it.durationSec) bits.push(T("${…} 分钟", { "${…1}": Math.round(it.durationSec / 60) }));
+      if (it.hasSpeakers) bits.push(T("有发言人"));
+      if (it.hasAudio) bits.push(T("音频可试听"));
       bits.push(fmtBytes(it.bytes));
-      if (it.notesFallbackReason) bits.push("⚠️ 笔记降级");
+      if (it.notesFallbackReason) bits.push(T("⚠️ 笔记降级"));
       right.textContent = bits.join(" · ");
       const open = document.createElement("button");
       open.className = "ghost";
-      open.textContent = "打开";
+      open.textContent = T("打开");
       open.addEventListener("click", () => openMeeting(it.dir));
       const spacer = document.createElement("span");
       spacer.style.flex = "1";
       row.append(left, spacer, right, open);
       box.appendChild(row);
     }
-    $("history-status").textContent = `${r.items.length} 个会议 · ${r.root}`;
+    $("history-status").textContent = T("${…} 个会议 · ${…}", { "${…1}": r.items.length, "${…2}": r.root });
   } catch (e) {
     console.error("meetingsList IPC failed:", e);
-    box.innerHTML = `<div class="hint">读取失败：${esc(e.message)}</div>`;
+    box.innerHTML = T("<div class=\"hint\">读取失败：${…}</div>", { "${…1}": esc(e.message) });
   }
 }
 
 async function openMeeting(dir) {
-  $("history-status").textContent = "打开中…";
+  $("history-status").textContent = T("打开中…");
   const r = await window.a2n.meetingsOpen({ dir });
   if (r.error) {
-    $("history-status").textContent = "打开失败：" + r.error;
+    $("history-status").textContent = T("打开失败：") + r.error;
     return;
   }
   currentDir = r.dir;
   // reuse the normal result view (it also loads the 发言人 panel for this dir)
   showResult({
-    notes: r.notes || "(这个会议没有 notes.md)",
+    notes: r.notes || T("(这个会议没有 notes.md)"),
     notesZh: r.notesZh || null,
     chunks: r.chunks || [],
     provider: r.provider || "",
@@ -620,8 +657,8 @@ async function openMeeting(dir) {
   // this meeting's roster becomes the name suggestions in the 发言人 rename inputs
   meetingParticipants = r.participants || [];
   $("tab-record").click();
-  $("record-status").textContent = "已打开历史会议：" + dir;
-  $("history-status").textContent = "已打开：" + dir;
+  $("record-status").textContent = T("已打开历史会议：") + dir;
+  $("history-status").textContent = T("已打开：") + dir;
 }
 
 const histRefresh = $("btn-history-refresh");
@@ -648,29 +685,29 @@ async function loadModels() {
     modelsState = await window.a2n.modelsStatus();
   } catch (e) {
     console.error("modelsStatus IPC failed:", e);
-    $("models-status").textContent = "模型状态读取失败：" + e.message;
+    $("models-status").textContent = T("模型状态读取失败：") + e.message;
     return;
   }
   const st = modelsState;
   $("cfg-model-endpoint").value = st.endpoint || "";
   $("cfg-auto-download").checked = st.autoDownload !== false;
-  $("models-total").textContent = `已占用 ${fmtBytes(st.totalBytes)}`;
+  $("models-total").textContent = T("已占用 ${…}", { "${…1}": fmtBytes(st.totalBytes) });
 
   const box = $("whisper-rows");
   box.innerHTML = "";
   for (const w of st.whisper) {
     const busy = modelBusy && modelBusy.kind === "whisper" && modelBusy.id === w.id;
     const state = busy
-      ? modelBusy.message || "下载中…"
+      ? modelBusy.message || T("下载中…")
       : w.ready
-        ? `已下载 ${fmtBytes(w.bytes)}${w.current ? " · 当前使用" : ""}`
-        : `未下载（约 ${w.approxMB} MB）${w.current ? " · 当前使用" : ""}`;
+        ? T("已下载 ${…}${…}", { "${…1}": fmtBytes(w.bytes), "${…2}": w.current ? T(" · 当前使用") : "" })
+        : T("未下载（约 ${…} MB）${…}", { "${…1}": w.approxMB, "${…2}": w.current ? T(" · 当前使用") : "" });
 
     const use = document.createElement("button");
     use.className = "ghost";
-    use.textContent = w.current ? "使用中" : "使用";
+    use.textContent = w.current ? T("使用中") : T("使用");
     use.disabled = !!w.current || !!modelBusy;
-    use.title = "把这个档位设为转写模型";
+    use.title = T("把这个档位设为转写模型");
     use.addEventListener("click", async () => {
       await window.a2n.setConfig({ whisper: { model: w.id } });
       await loadConfig();
@@ -679,22 +716,22 @@ async function loadModels() {
 
     const act = document.createElement("button");
     act.className = w.ready ? "ghost" : "primary";
-    act.textContent = w.ready ? "删除" : "下载";
+    act.textContent = w.ready ? T("删除") : T("下载");
     act.disabled = !!modelBusy;
     act.addEventListener("click", async () => {
       if (w.ready) {
-        if (!confirm(`删除 ${w.short}？下次使用会需要重新下载。`)) return;
-        modelBusy = { kind: "whisper", id: w.id, message: "删除中…" };
+        if (!confirm(T("删除 ${…}？下次使用会需要重新下载。", { "${…1}": w.short }))) return;
+        modelBusy = { kind: "whisper", id: w.id, message: T("删除中…") };
         await loadModels();
         const r = await window.a2n.modelsDelete({ kind: "whisper", id: w.id });
         modelBusy = null;
-        $("models-status").textContent = r.error ? "删除失败：" + r.error : `已删除 ${w.short}`;
+        $("models-status").textContent = r.error ? T("删除失败：") + r.error : T("已删除 ${…}", { "${…1}": w.short });
       } else {
-        modelBusy = { kind: "whisper", id: w.id, message: "准备下载…" };
+        modelBusy = { kind: "whisper", id: w.id, message: T("准备下载…") };
         await loadModels();
         const r = await window.a2n.modelsDownload({ kind: "whisper", id: w.id });
         modelBusy = null;
-        $("models-status").textContent = r.error ? "下载失败：" + r.error : `${w.short} 下载完成（${fmtBytes(r.bytes)}）`;
+        $("models-status").textContent = r.error ? T("下载失败：") + r.error : T("${…} 下载完成（${…}）", { "${…1}": w.short, "${…2}": fmtBytes(r.bytes) });
       }
       await loadModels();
     });
@@ -706,36 +743,40 @@ async function loadModels() {
   const vp = st.voiceprint;
   const vBusy = modelBusy && modelBusy.kind === "voiceprint";
   const vState = vBusy
-    ? modelBusy.message || "下载中…"
-    : vp.ready
-      ? `已下载 ${fmtBytes(vp.bytes)}`
-      : `未下载（约 ${vp.approxMB} MB）——「识别发言人」也需要它`;
+    ? modelBusy.message || T("下载中…")
+    : vp.downloaded
+      ? T("已下载 ${…}", { "${…1}": fmtBytes(vp.bytes) })
+      // the model ships INSIDE the app, so "not downloaded" would be misleading:
+      // the copy that actually loads is the bundled one.
+      : vp.ready
+        ? T("已随程序分发 ${…}（无需下载）", { "${…1}": fmtBytes(vp.bytes) })
+        : T("未下载（约 ${…} MB）——「识别发言人」也需要它", { "${…1}": vp.approxMB });
   const vAct = document.createElement("button");
-  vAct.className = vp.ready ? "ghost" : "primary";
-  vAct.textContent = vp.ready ? "删除" : "下载";
+  vAct.className = vp.downloaded ? "ghost" : "primary";
+  vAct.textContent = vp.downloaded ? T("删除") : T("下载");
   vAct.disabled = !!modelBusy;
   vAct.addEventListener("click", async () => {
-    if (vp.ready) {
-      if (!confirm("删除声纹模型？下次识别发言人会重新下载。")) return;
-      modelBusy = { kind: "voiceprint", message: "删除中…" };
+    if (vp.downloaded) {
+      if (!confirm(T("删除已下载的声纹模型？程序内置的那份仍然可用，识别发言人不会中断。"))) return;
+      modelBusy = { kind: "voiceprint", message: T("删除中…") };
       await loadModels();
       const r = await window.a2n.modelsDelete({ kind: "voiceprint" });
       modelBusy = null;
-      $("models-status").textContent = r.error ? "删除失败：" + r.error : "已删除声纹模型";
+      $("models-status").textContent = r.error ? T("删除失败：") + r.error : T("已删除已下载的声纹模型（继续使用内置那份）");
     } else {
-      modelBusy = { kind: "voiceprint", message: "准备下载…" };
+      modelBusy = { kind: "voiceprint", message: T("准备下载…") };
       await loadModels();
       const r = await window.a2n.modelsDownload({ kind: "voiceprint" });
       modelBusy = null;
-      $("models-status").textContent = r.error ? "下载失败：" + r.error : `声纹模型下载完成（${fmtBytes(r.bytes)}）`;
+      $("models-status").textContent = r.error ? T("下载失败：") + r.error : T("声纹模型下载完成（${…}）", { "${…1}": fmtBytes(r.bytes) });
     }
     await loadModels();
   });
-  sbox.appendChild(modelRow("声纹模型（3D-Speaker CAM++ 中英）", vState, [vAct]));
+  sbox.appendChild(modelRow(T("声纹模型（3D-Speaker CAM++ 中英）"), vState, [vAct]));
   sbox.appendChild(
     modelRow(
-      "声纹分割模型（随程序分发）",
-      st.segmentation.ready ? `已随包 ${fmtBytes(st.segmentation.bytes)}` : "缺失（打包异常）",
+      T("声纹分割模型（随程序分发）"),
+      st.segmentation.ready ? T("已随包 ${…}", { "${…1}": fmtBytes(st.segmentation.bytes) }) : T("缺失（打包异常）"),
       []
     )
   );
@@ -748,7 +789,7 @@ if (saveEndpointBtn) {
       endpoint: $("cfg-model-endpoint").value.trim(),
       autoDownload: $("cfg-auto-download").checked,
     });
-    $("models-status").textContent = r.error ? "保存失败：" + r.error : `已保存下载地址：${r.endpoint}`;
+    $("models-status").textContent = r.error ? T("保存失败：") + r.error : T("已保存下载地址：${…}", { "${…1}": r.endpoint });
   });
 }
 const autoDl = $("cfg-auto-download");
@@ -756,8 +797,8 @@ if (autoDl) {
   autoDl.addEventListener("change", async () => {
     const r = await window.a2n.modelsSetEndpoint({ autoDownload: autoDl.checked });
     $("models-status").textContent = r.error
-      ? "保存失败：" + r.error
-      : autoDl.checked ? "缺模型时将自动下载。" : "缺模型时将直接报错，不再自动下载。";
+      ? T("保存失败：") + r.error
+      : autoDl.checked ? T("缺模型时将自动下载。") : T("缺模型时将直接报错，不再自动下载。");
   });
 }
 const openModelsBtn = $("btn-open-models");
@@ -795,8 +836,8 @@ function applyLlmPreset(id) {
   $("llm-apikey").disabled = p.style === "ollama";
   $("llm-preset-note").textContent =
     (p.note || "") +
-    (p.probe ? `　（本机探测：${p.probe}）` : "") +
-    ((p.models || []).length ? " 示例模型可能已更新，点「测试连接」可拉取真实列表。" : "");
+    (p.probe ? T("　（本机探测：${…}）", { "${…1}": p.probe }) : "") +
+    ((p.models || []).length ? T(" 示例模型可能已更新，点「测试连接」可拉取真实列表。") : "");
 }
 
 const llmPresetSel = $("llm-preset");
@@ -826,7 +867,7 @@ if (llmTestBtn) {
   llmTestBtn.addEventListener("click", async () => {
     llmTestBtn.disabled = true;
     $("llm-test-status").classList.remove("warn");
-    $("llm-test-status").textContent = "测试中…";
+    $("llm-test-status").textContent = T("测试中…");
     $("llm-model-list").innerHTML = "";
     try {
       const r = await window.a2n.llmTest({
@@ -836,17 +877,17 @@ if (llmTestBtn) {
         model: $("llm-model").value.trim(),
       });
       if (!r.ok) {
-        $("llm-test-status").textContent = `✗ 连接失败：${r.error}${r.ms ? `（${r.ms}ms）` : ""}`;
+        $("llm-test-status").textContent = T("✗ 连接失败：${…}${…}", { "${…1}": r.error, "${…2}": r.ms ? `（${r.ms}ms）` : "" });
         $("llm-test-status").classList.add("warn");
         return;
       }
-      const warn = r.modelPresent === false ? " ⚠️ 填写的模型不在已安装列表里" : "";
+      const warn = r.modelPresent === false ? T(" ⚠️ 填写的模型不在已安装列表里") : "";
       $("llm-test-status").textContent = `✓ ${r.note}（${r.ms}ms）${warn}`;
       if (r.modelPresent === false) $("llm-test-status").classList.add("warn");
       if (r.models && r.models.length) {
         $("llm-model-list").innerHTML = r.models
           .slice(0, 30)
-          .map((m) => `<div class="dirrow"><span>${esc(m)}</span><button class="ghost pick" data-m="${esc(m)}">用这个</button></div>`)
+          .map((m) => T("<div class=\"dirrow\"><span>${…}</span><button class=\"ghost pick\" data-m=\"${…}\">用这个</button></div>", { "${…1}": esc(m) }))
           .join("");
         for (const b of $("llm-model-list").querySelectorAll("button.pick")) {
           b.addEventListener("click", () => { $("llm-model").value = b.dataset.m; });
@@ -875,7 +916,7 @@ if (llmSaveBtn) {
     await window.a2n.setConfig(partial);
     await loadConfig();
     $("llm-test-status").classList.remove("warn");
-    $("llm-test-status").textContent = "✓ 已保存为笔记接口";
+    $("llm-test-status").textContent = T("✓ 已保存为笔记接口");
   });
 }
 
@@ -883,7 +924,7 @@ if (window.a2n.onModels) {
   window.a2n.onModels((p) => {
     if (!p || !modelBusy || p.kind !== modelBusy.kind) return;
     modelBusy.message =
-      p.message || (p.percent != null ? `下载中 ${p.percent}%${p.file ? " · " + String(p.file).split("/").pop() : ""}` : "下载中…");
+      p.message || (p.percent != null ? T("下载中 ${…}%${…}", { "${…1}": p.percent, "${…2}": p.file ? " · " + String(p.file).split("/").pop() : "" }) : T("下载中…"));
     if (modelsState) loadModels();
   });
 }
@@ -898,7 +939,7 @@ async function loadPower() {
   } catch (e) {
     console.error("powerStatus IPC failed:", e); // never degrade silently
     const el = $("power-status");
-    if (el) el.textContent = "电源模式读取失败：" + e.message;
+    if (el) el.textContent = T("电源模式读取失败：") + e.message;
   }
 }
 
@@ -910,8 +951,11 @@ function renderPower() {
     for (const m of st.modes || []) {
       const b = document.createElement("button");
       b.dataset.mode = m.id;
-      b.textContent = m.icon + " " + m.label;
-      b.title = m.desc;
+      b.dataset.label = m.label || "";
+      b.dataset.desc = m.desc || "";
+      b.dataset.icon = m.icon || "";
+      b.textContent = b.dataset.icon + " " + (window.I18N ? window.I18N.resolve(b.dataset.label) : b.dataset.label);
+      b.title = window.I18N ? window.I18N.resolve(b.dataset.desc) : b.dataset.desc;
       b.addEventListener("click", async () => {
         const r = await window.a2n.powerSetMode({ mode: m.id });
         powerState = { ...powerState, profile: r.profile, requested: m.id, describe: r.describe, queue: r.queue };
@@ -922,7 +966,13 @@ function renderPower() {
     box.dataset.built = "1";
   }
   if (box) {
-    for (const b of box.querySelectorAll("button")) b.classList.toggle("active", b.dataset.mode === st.requested);
+    for (const b of box.querySelectorAll("button")) {
+      b.classList.toggle("active", b.dataset.mode === st.requested);
+      // labels come from the backend in Chinese: re-resolve them on every pass so a
+      // language switch updates these chips too
+      b.textContent = b.dataset.icon + " " + (window.I18N ? window.I18N.resolve(b.dataset.label) : b.dataset.label);
+      b.title = window.I18N ? window.I18N.resolve(b.dataset.desc) : b.dataset.desc;
+    }
   }
   const pref = $("power-batt-pref");
   if (pref) {
@@ -930,9 +980,24 @@ function renderPower() {
     pref.hidden = st.requested !== "auto";
   }
   const p = st.profile || {};
-  const lines = [`${st.onBattery ? "🔋 电池供电" : "🔌 插电"} · ${st.describe || ""}`];
-  if (p.engine && p.engine.reason) lines.push("⚠️ " + p.engine.reason);
-  if (p.notes && p.notes.length) lines.push(...p.notes.map((n) => "· " + n));
+  /* EVERY line here comes from the MAIN process (powerMode.js), so each has to go
+   * through I18N.resolve() — t() would be wrong because these are raw backend
+   * strings, not dictionary keys the renderer chose.
+   *
+   * The badge itself used to be one pre-joined " · " line (describe), which NO
+   * dictionary key can match, so it rendered Chinese in the English UI — that is the
+   * "引擎: CPU" in the reported screenshot. describeParts supplies the pieces
+   * instead; fall back to the joined string if an older backend sends only that. */
+  const R = (s) => (window.I18N && s ? window.I18N.resolve(s) : s);
+  const dp = st.describeParts;
+  const badge = dp
+    ? [dp.label, `${R(dp.enginePrefix)}${R(dp.engine)}`, `${R(dp.modelPrefix)}${R(dp.model)}`, R(dp.runNow)]
+        .map(R)
+        .join(" · ")
+    : R(st.describe || "");
+  const lines = [T("${…} · ${…}", { "${…1}": st.onBattery ? T("🔋 电池供电") : T("🔌 插电"), "${…2}": badge })];
+  if (p.engine && p.engine.reason) lines.push("⚠️ " + R(p.engine.reason));
+  if (p.notes && p.notes.length) lines.push(...p.notes.map((n) => "· " + R(n)));
   const el = $("power-status");
   el.textContent = lines.join("\n");
   el.style.whiteSpace = "pre-line";
@@ -943,12 +1008,10 @@ function renderPower() {
     $("queue-list").innerHTML = jobs
       .map(
         (j) =>
-          `<div class="dirrow"><span>${esc(String(j.dir).split(/[\\/]/).pop())}</span><span>${
-            j.durationSec ? Math.round(j.durationSec / 60) + " 分钟 · " : ""
-          }${esc(j.reason || "")}${j.attempts ? " · 重试 " + j.attempts : ""}</span></div>`
+          T("<div class=\"dirrow\"><span>${…}</span><span>${…}${…}${…}</span></div>", { "${…1}": esc(String(j.dir).split(/[\\/]/).pop()), "${…2}": j.durationSec ? Math.round(j.durationSec / 60) + T(" 分钟 · ") : "", "${…3}": esc(R(j.reason || "")), "${…4}": j.attempts ? T(" · 重试 ") + j.attempts : "" })
       )
       .join("");
-    $("btn-queue-run").textContent = st.queueRunning ? "处理中…" : "立即处理";
+    $("btn-queue-run").textContent = st.queueRunning ? T("处理中…") : T("立即处理");
     $("btn-queue-run").disabled = !!st.queueRunning;
   }
 }
@@ -965,7 +1028,7 @@ const queueRunBtn = $("btn-queue-run");
 if (queueRunBtn) {
   queueRunBtn.addEventListener("click", async () => {
     queueRunBtn.disabled = true;
-    queueRunBtn.textContent = "处理中…";
+    queueRunBtn.textContent = T("处理中…");
     await window.a2n.queueRunNow();
     await loadPower();
   });
@@ -974,7 +1037,7 @@ if (window.a2n.onPower) window.a2n.onPower(() => loadPower());
 if (window.a2n.onQueue) {
   window.a2n.onQueue((e) => {
     if (e && e.type === "start") {
-      $("pipeline").textContent = `处理排队会议：${String(e.dir).split(/[\\/]/).pop()}…`;
+      $("pipeline").textContent = T("处理排队会议：${…}…", { "${…1}": String(e.dir).split(/[\\/]/).pop() });
     }
     loadPower();
   });
@@ -993,9 +1056,16 @@ const pRows = $("participants-rows");
  * that a merely dimmed button reads as "my click did nothing" — and the user then
  * clicks again. Restored on open AND on close, so a cancelled or timed-out submit
  * can never leave the pending label stuck on screen. */
-const SAVE_IDLE_LABEL = $("participants-save").textContent;
-const UNCHANGED_IDLE_LABEL = $("participants-unchanged").textContent;
-const SAVE_PENDING_LABEL = "保存中…";
+/* Bug fixed here: these two were captured with `textContent` at load time, which is
+ * BEFORE the language is applied (applyStatic runs later in the init block). The
+ * captured value was therefore the Chinese FALLBACK text from index.html, and
+ * resetParticipantsButtons() wrote it back on every modal open — silently undoing
+ * the English that applyStatic had put there. Seen in a real run: the 保存 /
+ * 不需要更改参会人 buttons stayed Chinese in an otherwise-English modal.
+ * Translate the fallback text instead, so the idle label follows the language. */
+const SAVE_IDLE_LABEL = T($("participants-save").textContent);
+const UNCHANGED_IDLE_LABEL = T($("participants-unchanged").textContent);
+const SAVE_PENDING_LABEL = T("保存中…");
 
 function resetParticipantsButtons() {
   const save = $("participants-save");
@@ -1004,6 +1074,11 @@ function resetParticipantsButtons() {
   keep.disabled = false;
   save.textContent = SAVE_IDLE_LABEL;
   keep.textContent = UNCHANGED_IDLE_LABEL;
+  /* Re-apply the declarative translations for the whole modal. Writing textContent
+   * above destroys nothing else, but this also covers the 「以后停止时不要再问我」
+   * checkbox and any data-i18n added to the modal later. */
+  const overlay = $("participants-overlay");
+  if (overlay && window.I18N) window.I18N.applyStatic(overlay);
 }
 
 function participantRow(name) {
@@ -1011,15 +1086,15 @@ function participantRow(name) {
   row.className = "participant-row";
   const input = document.createElement("input");
   input.type = "text";
-  input.placeholder = "参会人名字…";
+  input.placeholder = T("参会人名字…");
   input.value = name || "";
   // Enter on a row must not blur/commit just that row — the modal's keydown
   // handler turns Enter into "save the whole roster"
   input.addEventListener("keydown", (e) => { if (e.key === "Enter") e.preventDefault(); });
   const rm = document.createElement("button");
   rm.className = "ghost";
-  rm.textContent = "移除";
-  rm.title = "移除这一位";
+  rm.textContent = T("移除");
+  rm.title = T("移除这一位");
   rm.addEventListener("click", () => row.remove());
   row.append(input, rm);
   return row;
@@ -1036,11 +1111,11 @@ function openParticipantsModal(e) {
   // rows instead of stacking a second modal on top
   participantsPending = e;
   participantsBusy = false;
-  $("participants-title").textContent = e.title || "参会人";
+  $("participants-title").textContent = e.title || T("参会人");
   $("participants-note").textContent =
     e.reason === "manual"
-      ? "重新编辑这场会议已保存的参会人名单。"
-      : "这些名字会和这场会议的笔记一起保存（笔记里的「你 / 远端」会变成具体人名）。";
+      ? T("重新编辑这场会议已保存的参会人名单。")
+      : T("这些名字会和这场会议的笔记一起保存（笔记里的「你 / 远端」会变成具体人名）。");
   $("participants-noask").checked = false;
   seedParticipantRows(e.prefill);
   $("participants-overlay").hidden = false;
@@ -1099,7 +1174,7 @@ async function participantsSubmit(unchanged) {
   closeParticipantsModal();
   if (!answeredOk) {
     // the server may have timed out this request — still close, but be loud
-    $("record-status").textContent = "名单没有保存：这次询问已经超时。稍后停止录音时如果还需要名单，会再问你。";
+    $("record-status").textContent = T("名单没有保存：这次询问已经超时。稍后停止录音时如果还需要名单，会再问你。");
   }
 }
 
@@ -1156,9 +1231,25 @@ function showResult(res) {
   // Surface degradation loudly: a failed LLM call must never look like a real summary.
   const warn = [];
   if (res.notesFallbackReason) {
-    warn.push(`⚠️ 摘要降级为规则提取（原因：${res.notesFallbackReason}）—— 笔记顶部已标注，点「重新生成」可重试`);
+    warn.push(T("⚠️ 摘要降级为规则提取（原因：${…}）—— 笔记顶部已标注，点「重新生成」可重试", { "${…1}": res.notesFallbackReason }));
   }
   if (res.notesWarnings && res.notesWarnings.length) warn.push(...res.notesWarnings);
+  /* A track that recorded nothing is reported HERE, in the result, not only during
+   * recording. Observed failure: a meeting whose mic track was 0.7 % active across ten
+   * minutes — the pipeline succeeded, only the system audio transcribed, and nothing
+   * said so anywhere. meta.json now carries peakDbfs/activePercent per track, so this
+   * can name the track and the number instead of the user having to guess. */
+  const tracks = (res.audioStats && res.audioStats.tracks) || [];
+  for (const tr of tracks) {
+    if (!TQ.isSilentTrack(tr)) continue;   // rule lives in renderer/trackQuality.js
+    const peak = typeof tr.peakDbfs === "number" ? tr.peakDbfs : null;
+    const active = typeof tr.activePercent === "number" ? tr.activePercent : null;
+    warn.push(T("⚠️ ${…} 轨没有录到声音（峰值 ${…} dBFS，有效样本 ${…}%）——检查默认输入设备或静音开关", {
+      "${…1}": tr.track,
+      "${…2}": peak === null ? "?" : peak.toFixed(1),
+      "${…3}": active === null ? "?" : active.toFixed(1),
+    }));
+  }
   if (warn.length) {
     $("regen-status").textContent = warn.join(" · ");
     $("regen-status").classList.add("warn");
@@ -1183,7 +1274,7 @@ async function loadSpeakers() {
   const st = await window.a2n.speakersStatus({ dir: currentDir });
   speakers = (st && st.speakers) || [];
   $("btn-diarize").disabled = !(st && st.hasSource);
-  $("btn-diarize").title = st && st.hasSource ? "" : "这个会议没有可用的音频（system/mixed）";
+  $("btn-diarize").title = st && st.hasSource ? "" : T("这个会议没有可用的音频（system/mixed）");
   renderSpeakerRows();
 }
 
@@ -1192,7 +1283,7 @@ function renderSpeakerRows() {
   box.innerHTML = "";
   if (!speakers.length) {
     box.innerHTML =
-      '<div class="hint">还没有识别发言人——点「识别发言人」按声音把他们分开（本地运行，首次会下载 27 MB 声纹模型）。</div>';
+      T('<div class="hint">还没有识别发言人——点「识别发言人」按声音把他们分开（本地运行，首次会下载 27 MB 声纹模型）。</div>');
     return;
   }
   // the meeting's roster is a <datalist> suggestion only — diarization order is not
@@ -1216,28 +1307,32 @@ function renderSpeakerRows() {
     play.className = "play";
     play.textContent = auditionId === s.id ? "■" : "▶";
     play.title = s.sample
-      ? `试听 ${(s.sample.durationSec || 0).toFixed(1)} 秒样本` + (s.lowConfidence ? "（样本偏短，可能不准）" : "")
-      : "没有样本";
+      ? T("试听 ${…} 秒样本", { "${…1}": (s.sample.durationSec || 0).toFixed(1) }) + (s.lowConfidence ? T("（样本偏短，可能不准）") : "")
+      : T("没有样本");
     play.disabled = !s.sample;
     if (s.lowConfidence) play.classList.add("lowconf");
     play.addEventListener("click", () => toggleAudition(s));
 
     const label = document.createElement("span");
     label.className = "spk-label";
-    label.textContent = s.id.replace(/^spk/, "发言人");
+    label.textContent = s.id.replace(/^spk/, T("发言人"));
 
     const input = document.createElement("input");
     input.type = "text";
     input.className = "spk-name";
-    input.placeholder = "填名字…";
+    input.placeholder = T("填名字…");
     input.value = s.name || "";
     if (meetingParticipants.length) input.list = "speaker-name-suggest"; // suggestions only
-    const commit = async () => {
-      const v = input.value.trim();
+    /* `value` lets the roster picker below reuse this commit path, and lets it commit a
+     * name that is already in the input (the typed-equals-current early return would
+     * otherwise swallow a dropdown pick of the same value). */
+    const commit = async (value) => {
+      const v = (value !== undefined ? String(value) : input.value).trim();
       if (v === (s.name || "")) return;
+      input.value = v; // keep the visible field in step when committed by the picker
       const res = await window.a2n.speakersSetName({ dir: currentDir, speakerId: s.id, name: v });
       if (res.error) {
-        $("diarize-status").textContent = "改名失败：" + res.error;
+        $("diarize-status").textContent = T("改名失败：") + res.error;
         return;
       }
       speakers = res.speakers;
@@ -1259,47 +1354,88 @@ function renderSpeakerRows() {
         }
       }
       $("diarize-status").textContent = res.notesPatched
-        ? `已更新：转写全部生效，笔记里 ${res.notesPatched} 处旧名字也一起改了`
-        : "已更新：转写全部生效（笔记里没有出现旧名字）";
+        ? T("已更新：转写全部生效，笔记里 ${…} 处旧名字也一起改了", { "${…1}": res.notesPatched })
+        : T("已更新：转写全部生效（笔记里没有出现旧名字）");
     };
     input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); });
-    input.addEventListener("blur", commit);
+    // NOT `commit` directly: addEventListener passes the EVENT as the first argument,
+    // and commit()'s first parameter is a value — the event object would be read as the
+    // name and coerced to "[object FocusEvent]".
+    input.addEventListener("blur", () => commit());
+
+    /* Roster picker.
+     *
+     * WHY: the attendee names are typed once in the participants modal, and then the
+     * speaker rows asked for them AGAIN with no connection between the two lists — you
+     * had to retype names you had just entered. This is a dropdown of the roster, so
+     * naming a voice is one click.
+     *
+     * It still does NOT auto-assign: diarization order is not roster order, and a wrong
+     * guess would misattribute everything that person said. You choose which name goes
+     * with the voice you just heard on ▶.
+     * Names already given to another speaker are not offered, so one person cannot be
+     * assigned to two rows by accident. */
+    const roster = (meetingParticipants || []).filter((n) => typeof n === "string" && n.trim());
+    if (roster.length) {
+      // rule lives in renderer/trackQuality.js (names already given to another speaker
+      // are not offered, so one person cannot be assigned to two rows by accident)
+      const options = TQ.pickableNames(roster, speakers, s.id);
+      const mine = String(s.name || "").trim();
+      if (options.length) {
+        const pick = document.createElement("select");
+        pick.className = "spk-pick compact";
+        pick.title = T("从参会人名单里选一个名字");
+        const ph = document.createElement("option");
+        ph.value = "";
+        ph.textContent = T("选参会人…");
+        pick.appendChild(ph);
+        for (const n of options) {
+          const o = document.createElement("option");
+          o.value = n;
+          o.textContent = n;
+          if (mine && n.trim().toLowerCase() === mine.toLowerCase()) o.selected = true;
+          pick.appendChild(o);
+        }
+        pick.addEventListener("change", () => { if (pick.value) commit(pick.value); });
+        row.append(pick);
+      }
+    }
 
     const meta = document.createElement("span");
     meta.className = "spk-meta";
-    meta.textContent = `${s.segments} 段 · ${fmtDur(s.durationSec)}` + (s.lowConfidence ? " · ⚠样本短" : "");
+    meta.textContent = T("${…} 段 · ${…}", { "${…1}": s.segments, "${…2}": fmtDur(s.durationSec) }) + (s.lowConfidence ? T(" · ⚠样本短") : "");
 
     row.append(play, label, input, meta);
 
     if (speakers.length > 1) {
       const merge = document.createElement("select");
       merge.className = "spk-merge compact";
-      merge.title = "把这一行合并到另一个发言人（修正过度切分）";
+      merge.title = T("把这一行合并到另一个发言人（修正过度切分）");
       const o0 = document.createElement("option");
       o0.value = "";
-      o0.textContent = "合并到…";
+      o0.textContent = T("合并到…");
       merge.appendChild(o0);
       for (const t of speakers) {
         if (t.id === s.id) continue;
         const o = document.createElement("option");
         o.value = t.id;
-        o.textContent = t.name || t.id.replace(/^spk/, "发言人");
+        o.textContent = t.name || t.id.replace(/^spk/, T("发言人"));
         merge.appendChild(o);
       }
       merge.addEventListener("change", async () => {
         const into = merge.value;
         if (!into) return;
-        if (!confirm(`把「${s.name || s.id}」的所有片段合并到「${(speakers.find((x) => x.id === into) || {}).name || into}」？`)) {
+        if (!confirm(T("把「${…}」的所有片段合并到「${…}」？", { "${…1}": s.name || s.id, "${…2}": (speakers.find((x) => x.id === into) || {}).name || into }))) {
           merge.value = "";
           return;
         }
         const res = await window.a2n.speakersMerge({ dir: currentDir, fromId: s.id, intoId: into });
-        if (res.error) { $("diarize-status").textContent = "合并失败：" + res.error; return; }
+        if (res.error) { $("diarize-status").textContent = T("合并失败：") + res.error; return; }
         speakers = res.speakers;
         lastResult.chunks = res.chunks;
         renderChunks();
         renderSpeakerRows();
-        $("diarize-status").textContent = "已合并。";
+        $("diarize-status").textContent = T("已合并。");
       });
       row.appendChild(merge);
     }
@@ -1318,13 +1454,13 @@ async function toggleAudition(s) {
   if (auditionAudio) { auditionAudio.pause(); auditionAudio = null; }
   const r = await window.a2n.speakersAudition({ dir: currentDir, speakerId: s.id });
   if (r.error) {
-    $("diarize-status").textContent = "试听失败：" + r.error;
+    $("diarize-status").textContent = T("试听失败：") + r.error;
     return;
   }
   auditionAudio = new Audio(r.dataUrl);
   auditionId = s.id;
   auditionAudio.onended = () => { auditionAudio = null; auditionId = null; renderSpeakerRows(); };
-  await auditionAudio.play().catch((e) => { $("diarize-status").textContent = "播放失败：" + e.message; });
+  await auditionAudio.play().catch((e) => { $("diarize-status").textContent = T("播放失败：") + e.message; });
   renderSpeakerRows();
 }
 
@@ -1332,11 +1468,11 @@ $("btn-diarize").addEventListener("click", async () => {
   if (!currentDir) return;
   const btn = $("btn-diarize");
   btn.disabled = true;
-  $("diarize-status").textContent = "识别中…（本地 CPU，长会议需要几分钟）";
+  $("diarize-status").textContent = T("识别中…（本地 CPU，长会议需要几分钟）");
   try {
     const res = await window.a2n.speakersDiarize({ dir: currentDir });
     if (res.error) {
-      $("diarize-status").textContent = "失败：" + res.error;
+      $("diarize-status").textContent = T("失败：") + res.error;
       return;
     }
     speakers = res.speakers;
@@ -1345,9 +1481,9 @@ $("btn-diarize").addEventListener("click", async () => {
     renderSpeakerRows();
     const lowConf = res.speakers.filter((s) => s.lowConfidence).length;
     $("diarize-status").textContent =
-      `识别到 ${res.speakers.length} 个发言人（按 ${res.source} 分析）` +
-      (lowConf ? ` · ${lowConf} 个样本偏短` : "") +
-      " —— 请逐个试听确认，填名字即可全场生效。";
+      T("识别到 ${…} 个发言人（按 ${…} 分析）", { "${…1}": res.speakers.length, "${…2}": res.source }) +
+      (lowConf ? T(" · ${…} 个样本偏短", { "${…1}": lowConf }) : "") +
+      T(" —— 请逐个试听确认，填名字即可全场生效。");
   } finally {
     btn.disabled = false;
   }
@@ -1375,10 +1511,10 @@ function renderChunks() {
 
     const badge = document.createElement("button");
     badge.className = "speaker";
-    badge.textContent = c.speakerName || "说话人";
-    badge.title = "点击改名";
+    badge.textContent = c.speakerName || T("说话人");
+    badge.title = T("点击改名");
     badge.addEventListener("click", async () => {
-      const name = prompt(`为「${badge.textContent}」设置名字：`, badge.textContent);
+      const name = prompt(T("为「${…}」设置名字：", { "${…1}": badge.textContent }), badge.textContent);
       if (!name || !name.trim() || name.trim() === badge.textContent) return;
       // prefer the STABLE id when the chunk has one: renaming by id never breaks,
       // renaming by display string loses the link after the first change
@@ -1390,9 +1526,9 @@ function renderChunks() {
         lastResult.chunks = res.chunks;
         if (byId && res.speakers) { speakers = res.speakers; renderSpeakerRows(); }
         renderChunks();
-        $("regen-status").textContent = "说话人已更新 — 点「重新生成」刷新笔记里的归属。";
+        $("regen-status").textContent = T("说话人已更新 — 点「重新生成」刷新笔记里的归属。");
       } else {
-        $("regen-status").textContent = "改名失败：" + (res.error || "unknown");
+        $("regen-status").textContent = T("改名失败：") + (res.error || "unknown");
       }
     });
 
@@ -1406,7 +1542,7 @@ function renderChunks() {
       text.textContent = c.text;
       const tr = document.createElement("span");
       tr.className = "translated";
-      tr.textContent = (c.translated && c.translated.trim()) ? c.translated : "（无译文）";
+      tr.textContent = (c.translated && c.translated.trim()) ? c.translated : T("（无译文）");
       text.appendChild(tr);
     } else if (mode === "zh") {
       text.textContent = (c.translated && c.translated.trim()) ? c.translated : c.text;
@@ -1437,20 +1573,20 @@ for (const [selId, fn] of [
 $("btn-regen").addEventListener("click", async () => {
   const btn = $("btn-regen");
   btn.disabled = true;
-  $("regen-status").textContent = "重新生成中…";
+  $("regen-status").textContent = T("重新生成中…");
   try {
     const res = await window.a2n.regenerateNotes({
       dir: currentDir,
       detailLevel: $("detail-level").value,
     });
     if (res.error) {
-      $("regen-status").textContent = "失败：" + res.error;
+      $("regen-status").textContent = T("失败：") + res.error;
     } else {
       lastResult.notes = res.notes;
       lastResult.notesZh = res.notesZh || null;
       $("notes-provider").textContent = res.provider || "";
       updateNotes();
-      $("regen-status").textContent = "已重新生成 ✓";
+      $("regen-status").textContent = T("已重新生成 ✓");
       setTimeout(() => ($("regen-status").textContent = ""), 3000);
     }
   } finally {
@@ -1473,9 +1609,16 @@ function fmtTime(sec) {
 window.a2n.onLevel(({ source, level }) => {
   const el = $(`level-${source}`);
   if (el) el.style.width = level + "%";
+  // feed the silence watchdog (see startMicWatchdog)
+  if (recording && source === "mic") {
+    micTotalSamples++;
+    if (Number(level) >= MIC_LEVEL_FLOOR) micLoudSamples++;
+  }
 });
 window.a2n.onPipeline((p) => {
-  $("pipeline").textContent = p.message || p.phase || "";
+  lastPipeline = p.message || p.phase || "";
+  // backend messages are Chinese (or already English); resolve() leaves unknown ones alone
+  $("pipeline").textContent = window.I18N ? window.I18N.resolve(lastPipeline) : lastPipeline;
   if (typeof p.progress === "number") setProgress(p.progress);
   if (p.phase === "done" || p.phase === "error") setProgress(p.phase === "done" ? 100 : 0);
 });
@@ -1486,6 +1629,54 @@ window.a2n.onTranscript((t) => {
   }
 });
 
+/* ---- UI language ---- */
+function setLangButtons(lang) {
+  const seg = $("ui-lang");
+  if (!seg) return;
+  seg.querySelectorAll("button[data-lang]").forEach((b) => b.classList.toggle("active", b.dataset.lang === lang));
+}
+
+/* Re-render everything that was built from translated strings. Each step is
+ * guarded: several areas only exist once a config/result has loaded. */
+function refreshUiLanguage() {
+  if (window.I18N) window.I18N.applyStatic(document);
+  setLangButtons(window.I18N ? window.I18N.lang : "en");
+  if ($("pipeline") && lastPipeline) $("pipeline").textContent = window.I18N ? window.I18N.resolve(lastPipeline) : lastPipeline;
+  if (typeof renderPower === "function") renderPower();
+  if (typeof loadPower === "function") loadPower(); // also re-renders the deferred queue
+  if (typeof loadHistory === "function") loadHistory();
+  if (typeof loadModels === "function") loadModels();
+  if (typeof loadDevices === "function") loadDevices();
+  if (typeof fillLlmFields === "function") fillLlmFields();
+  if (typeof loadArchivePresets === "function") loadArchivePresets();
+  if (typeof renderChunks === "function") renderChunks();
+  if (lastResult) {
+    if (typeof renderSpeakerRows === "function") renderSpeakerRows();
+    if (typeof updateNotes === "function") updateNotes();
+  }
+}
+
+async function switchLang(id) {
+  if (!window.I18N) return;
+  if (window.I18N.lang !== id) {
+    window.I18N.setLang(id);
+    refreshUiLanguage();
+  }
+  setLangButtons(window.I18N.lang);
+  try {
+    await window.a2n.setConfig({ ui: { lang: window.I18N.lang } }); // deep-merges a partial config
+  } catch (e) {
+    console.error("could not persist ui.lang:", e); // never fail silently
+  }
+}
+
+const uiLang = $("ui-lang");
+if (uiLang) {
+  uiLang.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-lang]");
+    if (btn) switchLang(btn.dataset.lang);
+  });
+}
 function setProgress(p) {
   $("progress-fill").style.width = Math.max(0, Math.min(100, p)) + "%";
 }
@@ -1494,6 +1685,11 @@ function setProgress(p) {
 (async () => {
   await loadArchivePresets(); // must precede loadConfig (it selects a preset)
   await loadConfig();
+  // Language next: every loader below renders translated text. `ui.lang` is an
+  // optional config key, so an absent one falls back to I18N.DEFAULT_LANG ("en").
+  window.I18N.setLang((cfg && cfg.ui && cfg.ui.lang) || window.I18N.DEFAULT_LANG);
+  setLangButtons(window.I18N.lang);
+  window.I18N.applyStatic(document);
   await loadPower();
   await loadModels(); // also surfaces a broken model cache at start-up
   await loadDevices();
