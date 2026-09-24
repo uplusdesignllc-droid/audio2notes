@@ -153,22 +153,39 @@ async function ffmpegVersion() {
 let encoderNameCache = null;
 /**
  * Whether the bundled ffmpeg advertises an encoder by name (e.g. "libopus").
- * `ffmpeg -encoders` is run once and the encoder-name column is cached;
- * a failed probe behaves as "no encoders" so callers fail clearly.
- * @returns {Promise<boolean>}
+ *
+ * TRI-STATE on purpose — the answer "we could not find out" is NOT the same as
+ * "it is absent", and conflating the two produced a false, user-visible defect:
+ *
+ *   - `true`  — `ffmpeg -encoders` was read and the encoder IS present
+ *   - `false` — `ffmpeg -encoders` was read and the encoder is ABSENT
+ *   - `null`  — the probe could NOT be run, so the answer is UNKNOWN
+ *
+ * A probe that cannot create its temp file (measured case: the app process runs
+ * at Low integrity while `%TEMP%` is unlabelled/Medium, so the probe write is
+ * denied) is an infrastructure failure, not a missing codec. Reporting it as
+ * "this ffmpeg does not provide libopus" is simply false — the very same fd
+ * capture parses 215 encoders and finds libopus when the file is writable — and
+ * it silently skipped compression for every meeting. Such callers must treat
+ * `null` as unknown, warn, and proceed to encode (the encode step verifies its
+ * own work, so a genuinely absent encoder still fails, but truthfully).
+ *
+ * The encoder-name column is cached ONLY after a SUCCESSFUL read; a failed probe
+ * leaves the cache null so the next call retries instead of caching a transient
+ * failure for the whole run.
+ * @returns {Promise<boolean|null>} true / false / null (unknown), as above.
  */
 async function hasEncoder(name) {
   if (encoderNameCache == null) {
-    const set = new Set();
     const out = await captureFfmpegOutput(["-hide_banner", "-encoders"]);
-    if (out != null) {
-      for (const line of String(out).split(/\r?\n/)) {
-        // Flag column is one of A/V/S followed by dots/letters, then the name
-        const m = line.match(/^\s*([AVS][.A-Z0-9]{0,6})[ \t]+(\S+)/);
-        if (m) set.add(m[2].toLowerCase());
-      }
+    if (out == null) return null; // probe failed — unknown, and do NOT cache it
+    const set = new Set();
+    for (const line of String(out).split(/\r?\n/)) {
+      // Flag column is one of A/V/S followed by dots/letters, then the name
+      const m = line.match(/^\s*([AVS][.A-Z0-9]{0,6})[ \t]+(\S+)/);
+      if (m) set.add(m[2].toLowerCase());
     }
-    encoderNameCache = set;
+    encoderNameCache = set; // cache only a successful probe
   }
   return encoderNameCache.has(String(name).toLowerCase());
 }
@@ -328,8 +345,12 @@ async function archiveFile(srcPath, opts = {}) {
 
   const tmp = out + ".tmp";
   try {
-    if (!(await hasEncoder(preset.codec))) {
+    const encoder = await hasEncoder(preset.codec);
+    if (encoder === false) {
       throw new Error(`编码器缺失：此 ffmpeg 未提供“${preset.codec}”编码器，无法压缩（请检查捆绑的 ffmpeg）`);
+    }
+    if (encoder === null) {
+      console.warn(`[audioArchive] could not probe the ffmpeg encoder list; treating "${preset.codec}" as unknown and proceeding — the encode step will fail with a real error if it is genuinely absent.`);
     }
     const ok = await runFfmpeg(encodeArgs(preset, srcPath, tmp));
     if (!ok || !fs.existsSync(tmp)) throw new Error("ffmpeg 编码失败");
@@ -366,14 +387,21 @@ async function archiveDir(dir, opts = {}, onProgress) {
     return { ...res, ok: false, errors: [{ file: dir, message: e.message }] };
   }
   /* Pre-flight: if the bundled ffmpeg lacks the target encoder, fail here with
-   * one clear error instead of one mystery failure per file. */
-  if (names.length && !(await hasEncoder(resolvePreset(opts).codec))) {
+   * one clear error instead of one mystery failure per file. A probe that could
+   * not run (`null`) is UNKNOWN, not missing — warn and carry on. */
+  if (names.length) {
     const codec = resolvePreset(opts).codec;
-    return {
-      ...res,
-      ok: false,
-      errors: [{ file: dir, message: `编码器缺失：此 ffmpeg 未提供“${codec}”编码器，无法压缩（请检查捆绑的 ffmpeg）` }],
-    };
+    const encoder = await hasEncoder(codec);
+    if (encoder === false) {
+      return {
+        ...res,
+        ok: false,
+        errors: [{ file: dir, message: `编码器缺失：此 ffmpeg 未提供“${codec}”编码器，无法压缩（请检查捆绑的 ffmpeg）` }],
+      };
+    }
+    if (encoder === null) {
+      console.warn(`[audioArchive] could not probe the ffmpeg encoder list; treating "${codec}" as unknown and proceeding — each encode step will fail with a real error if it is genuinely absent.`);
+    }
   }
   let i = 0;
   for (const name of names) {
@@ -416,8 +444,12 @@ async function transcodeTo(srcPath, outPath, opts = {}) {
   const sourceDur = await probeDurationSec(srcPath); // may be null
   const tmp = outPath + ".tmp";
   try {
-    if (!(await hasEncoder(preset.codec))) {
+    const encoder = await hasEncoder(preset.codec);
+    if (encoder === false) {
       throw new Error(`编码器缺失：此 ffmpeg 未提供“${preset.codec}”编码器，无法编码（请检查捆绑的 ffmpeg）`);
+    }
+    if (encoder === null) {
+      console.warn(`[audioArchive] could not probe the ffmpeg encoder list; treating "${preset.codec}" as unknown and proceeding — the encode step will fail with a real error if it is genuinely absent.`);
     }
     const ok = await runFfmpeg(encodeArgs(preset, srcPath, tmp));
     if (!ok || !fs.existsSync(tmp)) throw new Error("ffmpeg 编码失败");
