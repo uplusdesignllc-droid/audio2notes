@@ -28,6 +28,10 @@ debug.log
 # BUILD-STATE.md is an internal build log (machine paths, hardware, environment
 # notes). It stays on disk but must not be published.
 BUILD-STATE.md
+# HANDOFF-NEW-PROJECT.md is the same class of document: machine paths, the
+# workspace's ACL SIDs, and notes about this specific workstation. It is written
+# for whoever picks this project up on THIS machine, not for the public repo.
+HANDOFF-NEW-PROJECT.md
 # notes and scripts from a different, unrelated feature
 dsh-voice-agent/
 VOICE-AGENT-TASK.md
