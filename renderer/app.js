@@ -1501,17 +1501,33 @@ async function saveSpeakerConfirm() {
     const r = confirmRowsById.get(s.id);
     if (r) await r.commit();
   }
-  // reuses the Regenerate button's own status slot, so no new user-visible string
-  if ($("regen-status")) $("regen-status").textContent = T("重新生成中…");
-  const err = await regenNotesWithCurrentNames();
+  /* The names are on disk by now. CLOSE THE CARD BEFORE REGENERATING.
+   * Regeneration is a full LLM pass - minutes on a real meeting - and holding this card
+   * open for it, with Save disabled and no progress of its own, is indistinguishable from
+   * a freeze: the owner killed the app at exactly this point. The regeneration now runs
+   * behind the normal pipeline progress UI, where the rest of the app reports its work. */
   closeSpeakerConfirm();
   renderChunks();
   renderSpeakerRows();
   if ($("regen-status")) {
-    $("regen-status").classList.toggle("warn", !!err);
-    $("regen-status").textContent = err ? T("失败：") + err : T("已重新生成 ✓");
+    $("regen-status").classList.remove("warn");
+    $("regen-status").textContent = T("重新生成中…"); // reuses the Regenerate button's slot
   }
-  if (!err) setTimeout(() => { if ($("regen-status")) $("regen-status").textContent = ""; }, 3000);
+  /* Deliberately NOT awaited: the card is gone, so nothing is blocked. A rejection is
+   * caught here rather than left unhandled, and lands in the same status slot. */
+  regenNotesWithCurrentNames()
+    .then((err) => {
+      if (!$("regen-status")) return;
+      $("regen-status").classList.toggle("warn", !!err);
+      $("regen-status").textContent = err ? T("失败：") + err : T("已重新生成 ✓");
+      if (!err) setTimeout(() => { if ($("regen-status")) $("regen-status").textContent = ""; }, 3000);
+    })
+    .catch((e) => {
+      if ($("regen-status")) {
+        $("regen-status").classList.add("warn");
+        $("regen-status").textContent = T("失败：") + ((e && e.message) || "unknown");
+      }
+    });
 }
 
 /* Shared by the modal's 保存 and the panel's 重新生成 button: the summarizer reads
