@@ -32,6 +32,20 @@ BUILD-STATE.md
 dsh-voice-agent/
 VOICE-AGENT-TASK.md
 
+# ---- one-off tree backups ----
+# Written by folder-sync operations before they overwrite files. Transient by
+# definition: the content is a snapshot of files that are themselves tracked.
+.backup-before-sync-*/
+
+# ---- editor / tooling backups of source files ----
+# These must NEVER reach a release: `files: ["renderer/**"]` in package.json
+# globs them into app.asar, and two stale ones did ship in 1.1.0 before this
+# rule existed. The build config also excludes them, belt and braces.
+*.bak
+*.bak2
+*.bak-*
+*.orig
+
 # ---- compiled capture tool ----
 # Rebuild with: npm run capture:build  (needs msys2 gcc)
 .cap/capture.exe
@@ -41,6 +55,12 @@ Thumbs.db
 desktop.ini
 .DS_Store
 
-# NOTE: assets/models/*.onnx (1.5 MB) and its LICENSE file ARE tracked on purpose:
-# the app cannot run without the segmentation model, and the license must ship with it.
+# NOTE: assets/models/*.onnx ARE tracked on purpose, and so are their LICENSE/NOTICE
+# files: the app cannot run without the segmentation model, and speaker recognition
+# ships the 27 MB CAM++ voiceprint so it works offline with no first-run download.
+# The licence must travel with each redistributed model (Apache-2.0 requires it).
+# Current payload: pyannote-segmentation-3-0.int8.onnx (1.5 MB),
+# silero_vad.onnx (0.6 MB), 3dspeaker_speech_campplus_..._advanced.onnx (27 MB).
+# The .scratch/ exclude above is what keeps the throwaway COPIES of the voiceprint
+# model (written by test runs) out of the repository.
 

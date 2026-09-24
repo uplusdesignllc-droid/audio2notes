@@ -1,0 +1,59 @@
+Bundled speaker voiceprint model — provenance and licence
+=========================================================
+
+File
+----
+  3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx
+  28 281 164 bytes (27.0 MB)
+  SHA-256  AA3CFC16963A10586A9393F5035D6D6B57E98D358B347F80C2A30BF4F00CEBA2
+
+What it is
+----------
+The speaker-embedding model used by Audio2Notes for speaker diarization. It turns a
+short span of speech into a voiceprint; the app then clusters those voiceprints to
+decide how many distinct voices are on the recording. It is the "who" half of
+diarization — the bundled pyannote segmentation model (see
+LICENSE-pyannote-segmentation-3-0.txt) is the "when" half, marking where speech
+turns happen.
+
+This file is a converted/quantized ONNX export of the CAM++ speaker-verification
+model from the 3D-Speaker project, distributed by the sherpa-onnx project as a
+release asset.
+
+Origin
+------
+  Upstream project : 3D-Speaker (Apache-2.0)
+                     https://github.com/modelscope/3D-Speaker
+  Distributed by   : sherpa-onnx (Apache-2.0)
+                     https://github.com/k2-fsa/sherpa-onnx
+  Download URL     : https://github.com/k2-fsa/sherpa-onnx/releases/download/
+                     speaker-recongition-models/
+                     3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx
+  Retrieved        : 2026-09-22
+
+Licence
+-------
+Apache License 2.0. The full licence text is in the file
+  LICENSE-3d-speaker-campplus.txt
+in this same directory, shipped alongside the model as Apache-2.0 section 4(a)
+requires for a redistribution. The 3D-Speaker README states: "3D-Speaker is released
+under the Apache License 2.0."
+
+3D-Speaker in turn acknowledges third-party components (Speechbrain, Wespeaker,
+D-TDNN, DINO, Vicreg, TalkNet-ASD, Ultra-Light-Fast-Generic-Face-Detector-1MB,
+pyannote.audio). The model file itself is redistributed unmodified from the
+sherpa-onnx release asset; its checksum above is the identity check.
+
+Why it is bundled
+-----------------
+Speaker recognition used to require a 27 MB download on first use, which made the
+feature unavailable offline and added a network dependency to the very first
+recording. Shipping the model removes that dependency. The per-user cache
+(<userData>/models/speaker/) still takes precedence when present, so a user who
+downloads a model explicitly runs what they downloaded; the bundled copy is the
+fallback. See src/diarize.js: resolveEmbeddingModel().
+
+Reference
+---------
+  Chen et al., "3D-Speaker-Toolkit: An Open Source Toolkit for Multi-modal Speaker
+  Verification and Diarization", ICASSP 2025.
