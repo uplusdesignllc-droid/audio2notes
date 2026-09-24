@@ -7,41 +7,6 @@ const { app, BrowserWindow, ipcMain, shell, dialog, Notification, powerMonitor }
 const bootProbe = require("./bootProbe");
 bootProbe.mark("main.js entered", "electron required");
 
-/* ---------------------------------------------------------------------------
- * Chromium sandbox: disabled by default, because on some Windows machines it
- * cannot initialise at all.
- *
- * VERIFIED ON THE OWNER'S MACHINE (2026-09-22, Windows 11 build 26200): the
- * packaged app aborted during startup with 0x80000003 (STATUS_BREAKPOINT) before
- * any window appeared. Bisecting the launch flags showed the whole set of GPU
- * flags (--disable-gpu, --disable-gpu-compositing, --in-process-gpu) made no
- * difference, while **--no-sandbox started it normally** — so the abort came from
- * Chromium's sandbox failing to initialise, not from the app's own code (which was
- * separately proven to load, register all IPC channels and reach its ready path).
- *
- * This is the only place that can set it: a command-line switch has to be appended
- * BEFORE the app is ready, and appending it from the renderer or after startup has
- * no effect.
- *
- * SECURITY TRADE-OFF, stated plainly: with the sandbox off, the renderer runs with
- * the user's own privileges, so a compromised renderer is a bigger deal. It is
- * therefore OPT-OUT: set A2N_SANDBOX=1 in the environment (or pass --enable-sandbox
- * on the command line) to turn it back on. Do that once the sandbox can initialise
- * on your machine — the most common cause of the failure is security software
- * blocking the process/token operations the sandbox needs.
- * ------------------------------------------------------------------------- */
-const SANDBOX_OPT_IN = process.env.A2N_SANDBOX === "1" || process.argv.includes("--enable-sandbox");
-if (SANDBOX_OPT_IN) {
-  console.log("[sandbox] sandbox ENABLED by request (A2N_SANDBOX=1 or --enable-sandbox)");
-} else {
-  /* Guarded on app.commandLine existing: test harnesses that compile this file with a
-   * minimal Electron stub (test/pollLevels.harness.js) provide an `app` without
-   * `commandLine`, and an unconditional call turned that into a TypeError at load —
-   * which is exactly how this was caught. */
-  if (app.commandLine) app.commandLine.appendSwitch("no-sandbox");
-  console.log("[sandbox] disabled (default). Set A2N_SANDBOX=1 to re-enable it.");
-}
-
 const path = require("path");
 const fs = require("fs");
 

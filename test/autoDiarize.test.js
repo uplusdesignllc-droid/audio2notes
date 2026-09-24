@@ -505,42 +505,47 @@ async function main() {
     return `removed ${path.basename(r.removed)}; bundled model intact`;
   });
 
-  await check("22. STATIC: Chromium sandbox is disabled by default, with an opt-out", () => {
-    /* Startup regression guard. On the owner's machine (Windows 11 26200) the packaged
-     * app aborted during startup with 0x80000003 before any window; bisecting launch
-     * flags showed --no-sandbox was the one that fixed it, i.e. Chromium's sandbox
-     * could not initialise. The switch MUST be appended before the app is ready —
-     * appending it later, or from the renderer, does nothing — so this pins both the
-     * call and its position.
+  await check("22. STATIC: the app must NOT disable the Chromium sandbox from JavaScript", () => {
+    /* INVERTED 2026-09-24. This check previously asserted the OPPOSITE - that
+     * main.js appended --no-sandbox - and its reversal is deliberate, so the
+     * history is worth keeping.
      *
-     * The patterns deliberately avoid the bare word "no-sandbox": it appears in the
-     * explanatory comment above the code, so a check that matched the comment would
-     * still pass with the real call deleted. */
-    /* Look for the call on a line that is NOT a comment. A plain regex search over
-     * the whole file matches the explanatory comment above the code (and a
-     * commented-out call), which a mutation test proved: commenting the real line out
-     * still passed. So scan line by line and reject comment lines. */
+     * An earlier build appended the switch from main.js to work around a
+     * 0x80000003 (STATUS_BREAKPOINT) abort on a machine whose Chromium sandbox
+     * could not initialise. That call is INEFFECTIVE: Chromium decides whether to
+     * initialise its sandbox before main.js runs, which is exactly why the .cmd
+     * launchers exist and why they pass --no-sandbox on the command line. The
+     * owner removed the dead in-app call.
+     *
+     * That removal kept getting lost. A folder-sync re-copied main.js from the
+     * sibling checkout and silently restored the block; the removal was never
+     * committed, so nothing objected. Meanwhile this very check was still
+     * asserting the block SHOULD be there, leaving the suite red against the
+     * owner's intent - an inconsistent state that could only be resolved by
+     * putting the block back.
+     *
+     * So the check now pins the opposite. If someone re-adds the in-app switch,
+     * this fails loudly and the conflict gets decided on purpose instead of
+     * arriving through a file copy. Putting it back deliberately means updating
+     * this check too - which is the point.
+     *
+     * NOTE: --no-sandbox itself is NOT gone. It is passed at launch by the .cmd
+     * launchers in the build output, which is the only place it can take effect.
+     * Those live in dist/ (not tracked here), so they cannot be asserted from
+     * this suite. */
     const mainLines = mainSrc.split(/\r?\n/);
-    let appendLine = -1, appendOffset = -1, running = 0;
+    let appendLine = -1;
     for (let i = 0; i < mainLines.length; i++) {
       const raw = mainLines[i];
+      if (/^\s*(\/\/|\*|\/\*)/.test(raw)) continue;   // whole-line comment
       const code = raw.replace(/\/\/.*$/, "");        // drop trailing line comments
-      if (/^\s*(\/\/|\*|\/\*)/.test(raw)) { running += raw.length + 1; continue; }  // whole-line comment
-      if (/app\.commandLine\.appendSwitch\(\s*"no-sandbox"\s*\)/.test(code)) { appendLine = i + 1; appendOffset = running; break; }
-      running += raw.length + 1;
+      if (/app\.commandLine\.appendSwitch\(\s*["']no-sandbox["']\s*\)/.test(code)) { appendLine = i + 1; break; }
     }
-    ok(appendLine > 0, "app.commandLine.appendSwitch for the sandbox must exist as UNCOMMENTED code (a commented-out line does not count)");
-    ok(mainSrc.includes('process.env.A2N_SANDBOX === "1"'), "the A2N_SANDBOX=1 opt-out must be honoured");
-    ok(mainSrc.includes('process.argv.includes("--enable-sandbox")'), "the --enable-sandbox opt-out must be honoured");
-    const optIn = mainSrc.indexOf("SANDBOX_OPT_IN");
-    const appRequire = mainSrc.indexOf('require("electron")');
-    const readyHandler = mainSrc.indexOf("app.whenReady()");
-    ok(optIn >= 0, "the SANDBOX_OPT_IN opt-out branch must exist");
-    ok(appRequire >= 0 && readyHandler > 0, "electron require / whenReady anchors not found");
-    ok(appendOffset > appRequire, "the switch must be appended after `app` is available");
-    ok(appendOffset < readyHandler, "the switch must be appended BEFORE app.whenReady(), or it has no effect");
-    ok(optIn < appendOffset, "the append must be guarded by the opt-out branch, so the opt-out can win");
-    return `appendSwitch at main.js:${appendLine} (offset ${appendOffset}, between require@${appRequire} and whenReady@${readyHandler}); opt-out: A2N_SANDBOX=1 / --enable-sandbox`;
+    ok(appendLine === -1,
+      `main.js must NOT disable the sandbox in-app, but an uncommented appendSwitch("no-sandbox") is at line ${appendLine}`);
+    ok(!mainSrc.includes("SANDBOX_OPT_IN"),
+      "the SANDBOX_OPT_IN opt-out branch must be gone with the call it guarded");
+    return "no in-app sandbox switch (the .cmd launchers pass --no-sandbox at launch)";
   });
 
   console.log(failures ? `\n${failures} CHECK(S) FAILED` : "\nall checks passed");
