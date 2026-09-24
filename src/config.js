@@ -67,7 +67,12 @@ const DEFAULTS = {
     },
   },
   participants: {
-    askOnStop: true,     // show the participant roster modal when a recording stops
+    /* OFF by default since the post-recording naming card took this job over. That card
+     * runs at the right moment - after diarization, when the 5-second clips exist and the
+     * names can actually reach the transcript and the notes - whereas this prompt fires at
+     * STOP, before any voice has been separated. Kept switchable: set true to get the old
+     * stop-time roster prompt back (it still feeds the name-suggestion list). */
+    askOnStop: false,    // show the participant roster modal when a recording stops
     timeoutMs: 300000,   // how long notes generation waits for an answer (5 min)
   },
   diarize: {
