@@ -1,5 +1,47 @@
 "use strict";
 const { app, BrowserWindow, ipcMain, shell, dialog, Notification, powerMonitor } = require("electron");
+
+/* Boot-timing probe. Inert unless A2N_BOOT_LOG=1; required FIRST so that the
+ * first mark captures the cost of loading electron itself. See src/bootProbe.js
+ * for how to read the output. */
+const bootProbe = require("./bootProbe");
+bootProbe.mark("main.js entered", "electron required");
+
+/* ---------------------------------------------------------------------------
+ * Chromium sandbox: disabled by default, because on some Windows machines it
+ * cannot initialise at all.
+ *
+ * VERIFIED ON THE OWNER'S MACHINE (2026-09-22, Windows 11 build 26200): the
+ * packaged app aborted during startup with 0x80000003 (STATUS_BREAKPOINT) before
+ * any window appeared. Bisecting the launch flags showed the whole set of GPU
+ * flags (--disable-gpu, --disable-gpu-compositing, --in-process-gpu) made no
+ * difference, while **--no-sandbox started it normally** — so the abort came from
+ * Chromium's sandbox failing to initialise, not from the app's own code (which was
+ * separately proven to load, register all IPC channels and reach its ready path).
+ *
+ * This is the only place that can set it: a command-line switch has to be appended
+ * BEFORE the app is ready, and appending it from the renderer or after startup has
+ * no effect.
+ *
+ * SECURITY TRADE-OFF, stated plainly: with the sandbox off, the renderer runs with
+ * the user's own privileges, so a compromised renderer is a bigger deal. It is
+ * therefore OPT-OUT: set A2N_SANDBOX=1 in the environment (or pass --enable-sandbox
+ * on the command line) to turn it back on. Do that once the sandbox can initialise
+ * on your machine — the most common cause of the failure is security software
+ * blocking the process/token operations the sandbox needs.
+ * ------------------------------------------------------------------------- */
+const SANDBOX_OPT_IN = process.env.A2N_SANDBOX === "1" || process.argv.includes("--enable-sandbox");
+if (SANDBOX_OPT_IN) {
+  console.log("[sandbox] sandbox ENABLED by request (A2N_SANDBOX=1 or --enable-sandbox)");
+} else {
+  /* Guarded on app.commandLine existing: test harnesses that compile this file with a
+   * minimal Electron stub (test/pollLevels.harness.js) provide an `app` without
+   * `commandLine`, and an unconditional call turned that into a TypeError at load —
+   * which is exactly how this was caught. */
+  if (app.commandLine) app.commandLine.appendSwitch("no-sandbox");
+  console.log("[sandbox] disabled (default). Set A2N_SANDBOX=1 to re-enable it.");
+}
+
 const path = require("path");
 const fs = require("fs");
 
@@ -21,6 +63,7 @@ const participants = require("./participants");
 const models = require("./models");
 const llmProviders = require("./llmProviders");
 const os = require("os");
+bootProbe.mark("module requires done", "config/capture/transcribe/... loaded");
 
 let win = null;
 let rec = { system: null, mic: null, levelTimers: [], busy: false, limitFired: false, limitReached: null };
@@ -200,6 +243,7 @@ function notifyDone(dir) {
 }
 
 function createWindow() {
+  bootProbe.mark("createWindow entered");
   win = new BrowserWindow({
     width: 980,
     height: 760,
@@ -212,7 +256,27 @@ function createWindow() {
       nodeIntegration: false,
     },
   });
+  bootProbe.mark("BrowserWindow constructed", "this is the point the native window exists");
+
+  /* First paint of the renderer. 'ready-to-show' fires when the page is rendered
+   * and the window can be shown without a white flash — the closest in-app
+   * signal to "the user can see something", which is what the ~10 s report is
+   * about. did-finish-load follows the full DOM load. */
+  win.once("ready-to-show", () => {
+    bootProbe.mark("renderer ready-to-show", "window can be painted");
+    bootProbe.flush();
+  });
+  win.webContents.once("did-finish-load", () => {
+    bootProbe.mark("renderer did-finish-load");
+    bootProbe.flush();
+  });
+  win.webContents.once("did-fail-load", (_e, code, desc) => {
+    bootProbe.mark("renderer did-fail-load", `code=${code} ${desc}`);
+    bootProbe.flush();
+  });
+
   win.loadFile(path.join(__dirname, "..", "renderer", "index.html"));
+  bootProbe.mark("loadFile called", "async: returns before the renderer paints");
 
   // A roster question may be pending when the window closes; abandon it so the
   // in-flight wait() resolves ("cancelled") instead of blocking notes forever.
@@ -456,6 +520,7 @@ async function processQueuedDir(job) {
       model: profile.model,
       cacheDir: config.modelCacheDir(cfg),
       endpoint: cfg.whisper.endpoint || "https://huggingface.co/",
+      tempDir: path.dirname(audioPath),
     });
     chunks = (t.chunks || []).map((c) => ({ ...c, speaker: "unknown", speakerName: "说话人" }));
     text = t.text || meetings.transcriptText(chunks);
@@ -952,11 +1017,14 @@ async function transcribeSources(sources, cfg, onProgress) {
   let mic = null, sys = null;
   if (sources.mic) {
     send("pipeline", { phase: "transcribing", message: "Transcribing microphone track…" });
-    mic = await transcribe.transcribeFile({ wavFile: sources.mic, model, cacheDir, onProgress, endpoint });
+    // tempDir: retry the decode beside the meeting audio if the system temp dir is
+    // refused (see transcribe.transcribeFile — a bare `ffmpeg exit -13` there used to
+    // kill the pipeline after mixing had already succeeded).
+    mic = await transcribe.transcribeFile({ wavFile: sources.mic, model, cacheDir, onProgress, endpoint, tempDir: path.dirname(sources.mic) });
   }
   if (sources.system) {
     send("pipeline", { phase: "transcribing", message: "Transcribing system-audio track…" });
-    sys = await transcribe.transcribeFile({ wavFile: sources.system, model, cacheDir, onProgress, endpoint });
+    sys = await transcribe.transcribeFile({ wavFile: sources.system, model, cacheDir, onProgress, endpoint, tempDir: path.dirname(sources.system) });
   }
   const chunks = meetings.mergeTracks(mic && mic.chunks, sys && sys.chunks);
   if (!chunks.length) {
@@ -1207,6 +1275,13 @@ async function stopRecordingAndProcess() {
     );
     await translateNotes(notes, cfg);
 
+    // Automatic speaker recognition runs at the END of the pipeline (after
+    // writeArtifacts + archive) so the 发言人 panel is populated the moment the
+    // notes appear. It NEVER fails the pipeline: a skip or an error is reported to
+    // the UI and recorded in meta/return as diarizationError.
+    let diarization = null;
+    let diarizationSkip = null;
+
     const meta = {
       createdAt: new Date().toISOString(),
       durationSec,
@@ -1225,6 +1300,7 @@ async function stopRecordingAndProcess() {
       translationSkipped: translated ? null : transcript.translationSkipped || null,
       translationEngine: translated ? cfg.translation.engine : null,
       speakerLabels: ["你", "远端"],
+      diarization: diarization ? { speakers: diarization.speakers.length, source: diarization.source, threshold: diarization.threshold } : null,
       capture: rec.captureInfo || null,
       limitReached: rec.limitReached || null,
       stopReason: rec.stopReason || null,
@@ -1246,6 +1322,65 @@ async function stopRecordingAndProcess() {
       console.error("archive failed:", e);
     }
 
+    /* Automatic speaker recognition — the LAST step of the pipeline on purpose:
+     * runDiarizationForDir rewrites transcript.json/.md/.txt, so it must come after
+     * meetings.writeArtifacts above. When it is skipped or fails the pipeline still
+     * finishes normally and says why (diarizationError) instead of failing. */
+    try {
+      const acfg = config.load();
+      let skipReason = null;
+      if (!(acfg.diarize && acfg.diarize.autoRun)) {
+        skipReason = "已关闭自动识别发言人";
+      } else {
+        /* preflight never downloads, so a missing 声纹模型 is handled HERE, keyed on
+         * the machine-readable `missing` field — never on the Chinese reason copy,
+         * which is free to be reworded without changing what the pipeline does. */
+        const st = diarize.preflight({ modelDir: config.modelCacheDir(acfg), sherpaReady: sherpaAvailable() });
+        if (!st.ok && st.missing !== "embedding") {
+          skipReason = st.reason; // sherpa or segmentation missing: nothing this step can do
+        } else if (!st.ok && acfg.whisper.autoDownload === false) {
+          // the user opted out of downloads, so proceed no further — but say so
+          skipReason = "声纹模型尚未下载（自动下载已关闭）";
+        } else if (!st.ok) {
+          // autoDownload on: proceed and let diarize() fetch the model itself
+          skipReason = null;
+        }
+      }
+      if (skipReason) {
+        diarizationSkip = skipReason; // a skip is ALWAYS reported, never silently "fine"
+        console.log("[diarize] 跳过自动识别发言人：" + skipReason);
+        // the pipelined copy is actionable; diarizationError keeps the short reason
+        const msg = skipReason === "声纹模型尚未下载（自动下载已关闭）"
+          ? "跳过自动识别发言人：声纹模型尚未下载，请在「模型与接口」页点下载"
+          : "跳过自动识别发言人：" + skipReason;
+        send("pipeline", { phase: "diarizing", message: msg });
+      } else {
+        send("pipeline", { phase: "diarizing", message: "自动识别发言人（本地 CPU，长会议需要几分钟）…" });
+        const res = await runDiarizationForDir(dir, acfg, (p) => {
+          const msg =
+            p.phase === "download-start" || p.phase === "downloading"
+              ? "下载声纹模型（约 27 MB）" + (typeof p.percent === "number" ? " " + p.percent + "%…" : "…") :
+            p.phase === "decoding" ? "解码音频…" :
+            p.phase === "diarizing" ? "识别说话人…" :
+            p.phase === "labelling" ? "整理结果…" : "识别发言人…";
+          send("pipeline", { phase: "diarizing", message: msg, progress: p.percent });
+        });
+        if (res && res.ok) {
+          diarization = res;
+          diarizationSkip = null;
+        } else {
+          const reason = (res && res.error) || "未知错误";
+          diarizationSkip = reason;
+          console.error("[diarize] 自动识别发言人失败：", reason);
+          send("pipeline", { phase: "diarizing", message: "自动识别发言人失败：" + reason });
+        }
+      }
+    } catch (e) {
+      diarizationSkip = e.message;
+      console.error("[diarize] 自动识别发言人异常（不影响笔记）：", e);
+      send("pipeline", { phase: "diarizing", message: "自动识别发言人失败：" + e.message });
+    }
+
     send("pipeline", { phase: "done", message: "Done", dir });
     notifyDone(dir);
     touchActivity();
@@ -1253,12 +1388,22 @@ async function stopRecordingAndProcess() {
     return {
       ok: true, dir, notes: notes.text, notesZh: notes.zh || null,
       transcript: transcript.text, zh: transcript.zh || null,
-      chunks: transcript.chunks, provider: notes.provider, durationSec,
+      provider: notes.provider, durationSec,
       notesFallbackReason: notes.fallbackReason || null,
       notesWarnings: notes.warnings || [],
       notesMapReduce: !!notes.mapReduce,
       notesChunks: notes.chunks || 1,
+      /* Per-track level summary (peakDbfs / activePercent, plus the silence-skip
+       * numbers). The renderer needs THIS one back, not just the copy written into
+       * meta.json: it is what lets showResult() say "the mic track recorded nothing"
+       * in the result panel, instead of the user discovering it after the fact. */
+      audioStats: transcript.audioStats || null,
       archive, archiveError,
+      // The speaker panel is populated from THIS result, so the renderer needs no
+      // second IPC call after a recording. diarizationError is why it is empty.
+      speakers: diarization ? diarization.speakers : [],
+      chunks: diarization && diarization.chunks ? diarization.chunks : transcript.chunks,
+      diarizationError: diarizationSkip || null,
       limitReached: rec.limitReached || null,
       stopReason: rec.stopReason || null,
       // Hand the confirmed roster back to the renderer so the speaker-naming rows
@@ -1270,6 +1415,43 @@ async function stopRecordingAndProcess() {
   } catch (e) {
     console.error("pipeline error:", e);
     send("pipeline", { phase: "error", message: e.message });
+    /* PERSIST THE FAILURE. Until now a pipeline error went only to console.error and
+     * the UI status line, so a user hit by a failure had nothing to send and no way
+     * to see what happened (observed: `ffmpeg exit -13` killed the run and left the
+     * meeting folder holding nothing but the raw .wav files). notes.failed.md already
+     * sets the precedent of writing a diagnostics artifact into the meeting folder.
+     * Written to the meeting folder, and to userData if THAT write fails — a
+     * permission error in the meeting folder is itself a plausible cause. */
+    const when = new Date().toISOString();
+    const body = [
+      "Audio2Notes pipeline failure",
+      "time        : " + when,
+      "meeting dir : " + (dir || "(unknown)"),
+      "stop reason : " + (rec.stopReason || "(none)"),
+      "duration    : " + (durationSec != null ? durationSec + "s" : "(unknown)"),
+      "",
+      "error       : " + e.message,
+      "",
+      "stack:",
+      String(e.stack || "(no stack)"),
+      "",
+      "environment:",
+      "  electron  : " + process.versions.electron,
+      "  chrome    : " + process.versions.chrome,
+      "  node      : " + process.versions.node,
+      "  platform  : " + process.platform + " " + process.arch,
+      "  userData  : " + app.getPath("userData"),
+      "  temp      : " + os.tmpdir(),
+    ].join("\n");
+    let wrote = null;
+    for (const target of [dir ? path.join(dir, "pipeline-error.log") : null,
+                          path.join(app.getPath("userData"), "pipeline-error.log")]) {
+      if (!target) continue;
+      try { fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, body, "utf8"); wrote = target; break; }
+      catch { /* try the next location */ }
+    }
+    if (wrote) send("pipeline", { phase: "error", message: e.message + " — details written to " + wrote });
+    else console.error("pipeline error: could not write pipeline-error.log to any location");
     rec.busy = false;
     return { error: e.message, dir };
   }
@@ -1364,6 +1546,9 @@ ipcMain.handle("file:transcribe", async (_e, filePath) => {
       model: cfg.whisper.model,
       cacheDir: config.modelCacheDir(cfg),
       endpoint: cfg.whisper.endpoint || "https://huggingface.co/",
+      // an imported file lives outside the meeting folder; use its own directory as
+      // the decode fallback (skipped automatically when it equals the temp dir)
+      tempDir: path.dirname(filePath),
     });
     const chunks = (r.chunks || []).map((c) => ({ ...c, speaker: "unknown", speakerName: "说话人" }));
     const audioStats = audioStatsOf(r.audio);
@@ -1586,6 +1771,74 @@ function diarizationSource(dir) {
   return null;
 }
 
+/**
+ * Run speaker diarization for one meeting folder and persist the result
+ * (samples/ + speakers.json + rewritten transcript + meta.speakers).
+ * Shared by the manual 「识别发言人」 button and the automatic pipeline step, so both
+ * paths produce exactly the same artifacts.
+ * @returns {Promise<{ok:boolean, speakers?:Array, chunks?:Array, source?:string,
+ *                    threshold?:number, segments?:Array, error?:string}>}
+ */
+async function runDiarizationForDir(dir, cfg, onProgress, threshold) {
+  const src = diarizationSource(dir);
+  if (!src) return { ok: false, error: "找不到可用于声纹分析的音频（system/mixed 都不存在）" };
+  const r = await diarize.diarize({
+    audioPath: src,
+    modelDir: config.modelCacheDir(cfg),
+    threshold: Number(threshold) || diarize.DEFAULT_THRESHOLD,
+    numThreads: 4,
+    onProgress,
+    /* Work in the meeting folder, NOT os.tmpdir(). decodeToSamples writes a large
+     * raw PCM temp file, and a decode into the system temp dir has already failed on
+     * one machine with `ffmpeg exit -13` (EACCES). This directory is one the app has
+     * demonstrably written to (the meeting audio is there), so the raw file is safe
+     * here — and it is deleted immediately after being read. */
+    workDir: dir,
+  });
+
+  const samples = await diarize.buildSamples({
+    audioPath: src, speakers: r.speakers, segments: r.segments, outDir: dir,
+  });
+
+  const speakers = r.speakers.map((s) => ({
+    id: s.id,
+    name: null, // display falls back to 发言人N until the user types a name
+    segments: s.segmentCount,
+    durationSec: s.durationSec,
+    sample: samples[s.id] || null,
+    lowConfidence: !samples[s.id] || (samples[s.id].durationSec || 0) < 2,
+  }));
+
+  const tfPath = path.join(dir, "transcript.json");
+  let chunks = [];
+  if (fs.existsSync(tfPath)) {
+    const tf = JSON.parse(fs.readFileSync(tfPath, "utf8"));
+    diarize.assignToChunks(tf.chunks, r.segments, speakers.length ? speakers[0].id : null);
+    // the mic track stays "你" — a physically separate voice path
+    for (const c of tf.chunks) if (c.speaker === "you") c.speakerName = "你";
+    applySpeakerNames(dir, speakers, tf.chunks);
+    for (const c of tf.chunks) if (c.speaker === "you") c.speakerName = "你";
+    fs.writeFileSync(tfPath, JSON.stringify(tf, null, 2), "utf8");
+    chunks = tf.chunks;
+  }
+
+  diarize.saveSpeakers(dir, {
+    version: 1,
+    createdAt: new Date().toISOString(),
+    model: diarize.EMBEDDING_MODEL,
+    threshold: r.threshold,
+    source: path.basename(src),
+    audioDurationSec: r.audioDurationSec,
+    segments: r.segments,
+    speakers,
+  });
+  writeSpeakersMeta(dir, speakers);
+  const tf2 = rewriteTranscript(dir);
+  if (tf2) chunks = tf2.chunks;
+
+  return { ok: true, speakers, chunks, segments: r.segments, source: path.basename(src), threshold: r.threshold };
+}
+
 function sherpaAvailable() {
   try { require("sherpa-onnx-node"); return true; } catch (e) { return e.message; }
 }
@@ -1606,66 +1859,27 @@ ipcMain.handle("speakers:diarize", async (_e, { dir, threshold } = {}) => {
   if (!dir) return { error: "no dir" };
   const src = diarizationSource(dir);
   if (!src) return { error: "找不到可用于声纹分析的音频（system/mixed 都不存在）" };
-  const cfg = config.load();
   try {
     send("pipeline", { phase: "diarizing", message: "识别发言人（首次使用会下载 27 MB 声纹模型）…" });
-    const r = await diarize.diarize({
-      audioPath: src,
-      modelDir: config.modelCacheDir(cfg),
-      threshold: Number(threshold) || diarize.DEFAULT_THRESHOLD,
-      numThreads: 4,
-      onProgress: (p) => {
-        const msg =
-          p.phase === "downloading" ? `下载声纹模型 ${p.percent}%…` :
-          p.phase === "decoding" ? "解码音频…" :
-          p.phase === "diarizing" ? "识别说话人…" :
-          p.phase === "labelling" ? "整理结果…" : "识别发言人…";
-        send("pipeline", { phase: "diarizing", message: msg, progress: p.percent });
-      },
-    });
-
-    const samples = await diarize.buildSamples({
-      audioPath: src, speakers: r.speakers, segments: r.segments, outDir: dir,
-    });
-
-    const speakers = r.speakers.map((s) => ({
-      id: s.id,
-      name: null, // display falls back to 发言人N until the user types a name
-      segments: s.segmentCount,
-      durationSec: s.durationSec,
-      sample: samples[s.id] || null,
-      lowConfidence: !samples[s.id] || (samples[s.id].durationSec || 0) < 2,
-    }));
-
-    const tfPath = path.join(dir, "transcript.json");
-    let chunks = [];
-    if (fs.existsSync(tfPath)) {
-      const tf = JSON.parse(fs.readFileSync(tfPath, "utf8"));
-      diarize.assignToChunks(tf.chunks, r.segments, speakers.length ? speakers[0].id : null);
-      // the mic track stays "你" — a physically separate voice path
-      for (const c of tf.chunks) if (c.speaker === "you") c.speakerName = "你";
-      applySpeakerNames(dir, speakers, tf.chunks);
-      for (const c of tf.chunks) if (c.speaker === "you") c.speakerName = "你";
-      fs.writeFileSync(tfPath, JSON.stringify(tf, null, 2), "utf8");
-      chunks = tf.chunks;
+    const st = diarize.preflight({ modelDir: config.modelCacheDir(config.load()), sherpaReady: sherpaAvailable() });
+    if (!st.ok) {
+      send("pipeline", { phase: "error", message: "识别发言人失败：" + st.reason });
+      return { error: st.reason };
     }
-
-    const record = diarize.saveSpeakers(dir, {
-      version: 1,
-      createdAt: new Date().toISOString(),
-      model: diarize.EMBEDDING_MODEL,
-      threshold: r.threshold,
-      source: path.basename(src),
-      audioDurationSec: r.audioDurationSec,
-      segments: r.segments,
-      speakers,
-    });
-    writeSpeakersMeta(dir, speakers);
-    const tf2 = rewriteTranscript(dir);
-    if (tf2) chunks = tf2.chunks;
-
-    send("pipeline", { phase: "done", message: `识别到 ${speakers.length} 个发言人`, dir });
-    return { ok: true, speakers, chunks, segments: r.segments, source: path.basename(src), threshold: r.threshold };
+    const res = await runDiarizationForDir(dir, config.load(), (p) => {
+      const msg =
+        p.phase === "downloading" ? `下载声纹模型 ${p.percent}%…` :
+        p.phase === "decoding" ? "解码音频…" :
+        p.phase === "diarizing" ? "识别说话人…" :
+        p.phase === "labelling" ? "整理结果…" : "识别发言人…";
+      send("pipeline", { phase: "diarizing", message: msg, progress: p.percent });
+    }, threshold);
+    if (!res.ok) {
+      send("pipeline", { phase: "error", message: "识别发言人失败：" + res.error });
+      return { error: res.error };
+    }
+    send("pipeline", { phase: "done", message: `识别到 ${res.speakers.length} 个发言人`, dir });
+    return { ok: true, ...res };
   } catch (e) {
     console.error("diarize error:", e);
     send("pipeline", { phase: "error", message: "识别发言人失败：" + e.message });
@@ -1896,6 +2110,10 @@ ipcMain.handle("power:status", async () => {
     modes: powerMode.MODES,
     profile,
     describe: powerMode.describe(profile),
+    /* The same badge as separate pieces. The renderer cannot translate the joined
+     * string above (no dictionary key can match a " · "-joined line whose values
+     * vary), so it resolves these parts individually. */
+    describeParts: powerMode.describeParts(profile),
     engines: eng,
     queue: readQueue().jobs,
     queueRunning,
@@ -1909,7 +2127,7 @@ ipcMain.handle("power:setMode", async (_e, { mode, batteryPreference } = {}) => 
   config.save(cfg);
   const profile = await currentProfile();
   touchActivity();
-  return { ok: true, profile, describe: powerMode.describe(profile), queue: readQueue().jobs };
+  return { ok: true, profile, describe: powerMode.describe(profile), describeParts: powerMode.describeParts(profile), queue: readQueue().jobs };
 });
 
 ipcMain.handle("queue:list", () => ({ ok: true, queue: readQueue().jobs, running: queueRunning }));
@@ -2152,11 +2370,21 @@ ipcMain.handle("lifecycle:touch", () => {
   return { ok: true };
 });
 
+/* The gap between "module requires done" and this line is Electron/Chromium
+ * bringing itself up (GPU process, app ready). If the ~10 s lives anywhere
+ * inside the app, it is here or in createWindow below. */
+bootProbe.mark("app.whenReady resolved", "Electron finished initialising");
+bootProbe.flush();
+
 app.whenReady().then(() => {
+  bootProbe.mark("whenReady callback entered");
   createWindow();
+  bootProbe.mark("createWindow returned");
   startLifecycleWatchdog();
   startPowerWatchers();
   startMeetingWatcher();
+  bootProbe.mark("watchers started");
+  bootProbe.flush();
   // pick up anything that was parked while the app was closed
   setTimeout(async () => {
     const profile = await currentProfile();
