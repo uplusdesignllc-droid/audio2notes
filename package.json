@@ -8,6 +8,7 @@
     "test": "node test/run.js",
     "prepackage": "node -e \"if(!require('fs').existsSync('.cap/capture.exe')){console.error('\\n缺少 .cap/capture.exe —— 请先运行: npm run capture:build （需要 msys2 gcc）\\n');process.exit(1)}\"",
     "package": "electron-builder --win portable",
+    "postpackage": "icacls dist\\win-unpacked\\Audio2Notes.exe /setintegritylevel Medium",
     "capture:build": "gcc -O2 -Wall -DINITGUID -o .cap/capture.exe .cap/capture.c -lole32 -luuid -lpropsys"
   },
   "author": "",

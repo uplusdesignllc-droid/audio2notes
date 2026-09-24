@@ -1607,7 +1607,17 @@ ipcMain.handle("notes:regenerate", async (_e, { dir, detailLevel } = {}) => {
   const cfg = config.load();
   if (detailLevel) {
     cfg.notes.detailLevel = detailLevel;
-    config.save(cfg);
+    /* Persisting a preference must never abort note generation: the in-memory cfg used
+     * just below already carries the level. A settings.json that cannot be written - a
+     * low-integrity process cannot write a medium object, which is exactly what happened
+     * when the app's own exe inherited a Low label - has to degrade to "not remembered
+     * next time", never to "cannot write notes at all". This unguarded call is what threw
+     * EPERM out of the IPC and, in the caller, left the naming card open. */
+    try {
+      config.save(cfg);
+    } catch (e) {
+      console.error("[notes:regenerate] could not persist detailLevel:", e && e.message);
+    }
   }
   const notes = await summarize.summarize(meetings.transcriptText(tf.chunks), cfg, (p) =>
     send("pipeline", { phase: "summarizing", message: p.message || "Writing notes…", progress: p.progress })
