@@ -378,6 +378,20 @@
     </div>
   </div>
 
+  <!-- 录音结束后的「给声音命名」弹窗：每个发言人一行，点 ▶ 试听 5 秒样本，填上名字。
+       刻意保留「取消」和 Escape——这份名单是便利，不是关卡，跳过不改变任何东西。 -->
+  <div id="speaker-confirm-overlay" class="speaker-confirm-overlay" role="dialog" aria-modal="true" tabindex="-1" hidden>
+    <div class="card speaker-confirm-card">
+      <h2 id="speaker-confirm-title" data-i18n="发言人">发言人</h2>
+      <p class="hint" id="speaker-confirm-note" data-i18n="（点 ▶ 试听 5 秒样本，输入框填名字，回车保存）">（点 ▶ 试听 5 秒样本，输入框填名字，回车保存）</p>
+      <div id="speaker-confirm-rows" class="speaker-rows speaker-confirm-rows"></div>
+      <div class="row speaker-confirm-actions">
+        <button id="speaker-confirm-save" class="primary" data-i18n="保存">保存</button>
+        <button id="speaker-confirm-skip" class="ghost" data-i18n="取消">取消</button>
+      </div>
+    </div>
+  </div>
+
   <script src="i18n.js"></script>
   <script src="trackQuality.js"></script>
   <script src="app.js"></script>

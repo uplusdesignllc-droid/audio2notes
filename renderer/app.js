@@ -1262,6 +1262,14 @@ function showResult(res) {
 let speakers = [];
 let auditionAudio = null;
 let auditionId = null;
+/* Meeting dirs whose post-recording naming modal has already auto-opened during THIS
+ * app run. One meeting must not re-ask every time a pipeline "done" event arrives
+ * (re-transcribe, regenerate, …). There is deliberately no manual way to reopen the
+ * modal: the inline 发言人 panel is the fallback for naming a speaker afterwards. */
+const speakerConfirmShown = new Set();
+/* speakerId -> { el, commit } for the rows currently mounted in #speaker-confirm-rows,
+ * so 保存 can commit exactly what is on screen even if a row re-rendered in between. */
+let confirmRowsById = new Map();
 
 function fmtDur(sec) {
   const m = Math.floor((sec || 0) / 60);
@@ -1300,147 +1308,159 @@ function renderSpeakerRows() {
   }
 
   for (const s of speakers) {
-    const row = document.createElement("div");
-    row.className = "speaker-row";
+    box.appendChild(buildSpeakerRow(s).el);
+  }
+}
 
-    const play = document.createElement("button");
-    play.className = "play";
-    play.textContent = auditionId === s.id ? "■" : "▶";
-    play.title = s.sample
-      ? T("试听 ${…} 秒样本", { "${…1}": (s.sample.durationSec || 0).toFixed(1) }) + (s.lowConfidence ? T("（样本偏短，可能不准）") : "")
-      : T("没有样本");
-    play.disabled = !s.sample;
-    if (s.lowConfidence) play.classList.add("lowconf");
-    play.addEventListener("click", () => toggleAudition(s));
+/* Build ONE speaker row: placeholder label + ▶ 5 s audition + name input (+ the roster
+ * picker and merge dropdown the panel shows when they apply). Returns
+ * `{ el, commit }`, where commit(value?) pushes a value through the existing
+ * speakersSetName path. renderSpeakerRows (the panel) and openSpeakerConfirm (the
+ * post-recording modal) both go through this, so the row exists in exactly one place. */
+function buildSpeakerRow(s) {
+  const row = document.createElement("div");
+  row.className = "speaker-row";
 
-    const label = document.createElement("span");
-    label.className = "spk-label";
-    label.textContent = s.id.replace(/^spk/, T("发言人"));
+  const play = document.createElement("button");
+  play.className = "play";
+  play.textContent = auditionId === s.id ? "■" : "▶";
+  play.title = s.sample
+    ? T("试听 ${…} 秒样本", { "${…1}": (s.sample.durationSec || 0).toFixed(1) }) + (s.lowConfidence ? T("（样本偏短，可能不准）") : "")
+    : T("没有样本");
+  play.disabled = !s.sample;
+  if (s.lowConfidence) play.classList.add("lowconf");
+  play.addEventListener("click", () => toggleAudition(s));
 
-    const input = document.createElement("input");
-    input.type = "text";
-    input.className = "spk-name";
-    input.placeholder = T("填名字…");
-    input.value = s.name || "";
-    if (meetingParticipants.length) input.list = "speaker-name-suggest"; // suggestions only
-    /* `value` lets the roster picker below reuse this commit path, and lets it commit a
-     * name that is already in the input (the typed-equals-current early return would
-     * otherwise swallow a dropdown pick of the same value). */
-    const commit = async (value) => {
-      const v = (value !== undefined ? String(value) : input.value).trim();
-      if (v === (s.name || "")) return;
-      input.value = v; // keep the visible field in step when committed by the picker
-      const res = await window.a2n.speakersSetName({ dir: currentDir, speakerId: s.id, name: v });
-      if (res.error) {
-        $("diarize-status").textContent = T("改名失败：") + res.error;
+  const label = document.createElement("span");
+  label.className = "spk-label";
+  label.textContent = s.id.replace(/^spk/, T("发言人"));
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "spk-name";
+  input.placeholder = T("填名字…");
+  input.value = s.name || "";
+  if (meetingParticipants.length) input.list = "speaker-name-suggest"; // suggestions only
+  /* `value` lets the roster picker below reuse this commit path, and lets it commit a
+   * name that is already in the input (the typed-equals-current early return would
+   * otherwise swallow a dropdown pick of the same value). */
+  const commit = async (value) => {
+    const v = (value !== undefined ? String(value) : input.value).trim();
+    if (v === (s.name || "")) return;
+    input.value = v; // keep the visible field in step when committed by the picker
+    const res = await window.a2n.speakersSetName({ dir: currentDir, speakerId: s.id, name: v });
+    if (res.error) {
+      if ($("diarize-status")) $("diarize-status").textContent = T("改名失败：") + res.error;
+      return;
+    }
+    speakers = res.speakers;
+    lastResult.chunks = res.chunks;
+    renderChunks();
+    renderSpeakerRows();
+    // the notes were patched on disk — pull the updated text back into the panel
+    if (res.notesPatched) {
+      try {
+        const m = await window.a2n.meetingsOpen({ dir: currentDir });
+        if (m && !m.error && m.notes) {
+          if (Array.isArray(m.participants)) meetingParticipants = m.participants;
+          lastResult.notes = m.notes;
+          lastResult.notesZh = m.notesZh || null;
+          updateNotes();
+        }
+      } catch (e) {
+        console.error("notes refresh after rename failed:", e);
+      }
+    }
+    if ($("diarize-status")) {
+      $("diarize-status").textContent = res.notesPatched
+        ? T("已更新：转写全部生效，笔记里 ${…} 处旧名字也一起改了", { "${…1}": res.notesPatched })
+        : T("已更新：转写全部生效（笔记里没有出现旧名字）");
+    }
+  };
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); });
+  // NOT `commit` directly: addEventListener passes the EVENT as the first argument,
+  // and commit()'s first parameter is a value — the event object would be read as the
+  // name and coerced to "[object FocusEvent]".
+  input.addEventListener("blur", () => commit());
+
+  /* Roster picker.
+   *
+   * WHY: the attendee names are typed once in the participants modal, and then the
+   * speaker rows asked for them AGAIN with no connection between the two lists — you
+   * had to retype names you had just entered. This is a dropdown of the roster, so
+   * naming a voice is one click.
+   *
+   * It still does NOT auto-assign: diarization order is not roster order, and a wrong
+   * guess would misattribute everything that person said. You choose which name goes
+   * with the voice you just heard on ▶.
+   * Names already given to another speaker are not offered, so one person cannot be
+   * assigned to two rows by accident. */
+  const roster = (meetingParticipants || []).filter((n) => typeof n === "string" && n.trim());
+  if (roster.length) {
+    // rule lives in renderer/trackQuality.js (names already given to another speaker
+    // are not offered, so one person cannot be assigned to two rows by accident)
+    const options = TQ.pickableNames(roster, speakers, s.id);
+    const mine = String(s.name || "").trim();
+    if (options.length) {
+      const pick = document.createElement("select");
+      pick.className = "spk-pick compact";
+      pick.title = T("从参会人名单里选一个名字");
+      const ph = document.createElement("option");
+      ph.value = "";
+      ph.textContent = T("选参会人…");
+      pick.appendChild(ph);
+      for (const n of options) {
+        const o = document.createElement("option");
+        o.value = n;
+        o.textContent = n;
+        if (mine && n.trim().toLowerCase() === mine.toLowerCase()) o.selected = true;
+        pick.appendChild(o);
+      }
+      pick.addEventListener("change", () => { if (pick.value) commit(pick.value); });
+      row.append(pick);
+    }
+  }
+
+  const meta = document.createElement("span");
+  meta.className = "spk-meta";
+  meta.textContent = T("${…} 段 · ${…}", { "${…1}": s.segments, "${…2}": fmtDur(s.durationSec) }) + (s.lowConfidence ? T(" · ⚠样本短") : "");
+
+  row.append(play, label, input, meta);
+
+  if (speakers.length > 1) {
+    const merge = document.createElement("select");
+    merge.className = "spk-merge compact";
+    merge.title = T("把这一行合并到另一个发言人（修正过度切分）");
+    const o0 = document.createElement("option");
+    o0.value = "";
+    o0.textContent = T("合并到…");
+    merge.appendChild(o0);
+    for (const t of speakers) {
+      if (t.id === s.id) continue;
+      const o = document.createElement("option");
+      o.value = t.id;
+      o.textContent = t.name || t.id.replace(/^spk/, T("发言人"));
+      merge.appendChild(o);
+    }
+    merge.addEventListener("change", async () => {
+      const into = merge.value;
+      if (!into) return;
+      if (!confirm(T("把「${…}」的所有片段合并到「${…}」？", { "${…1}": s.name || s.id, "${…2}": (speakers.find((x) => x.id === into) || {}).name || into }))) {
+        merge.value = "";
         return;
       }
+      const res = await window.a2n.speakersMerge({ dir: currentDir, fromId: s.id, intoId: into });
+      if (res.error) { if ($("diarize-status")) $("diarize-status").textContent = T("合并失败：") + res.error; return; }
       speakers = res.speakers;
       lastResult.chunks = res.chunks;
       renderChunks();
       renderSpeakerRows();
-      // the notes were patched on disk — pull the updated text back into the panel
-      if (res.notesPatched) {
-        try {
-          const m = await window.a2n.meetingsOpen({ dir: currentDir });
-          if (m && !m.error && m.notes) {
-            if (Array.isArray(m.participants)) meetingParticipants = m.participants;
-            lastResult.notes = m.notes;
-            lastResult.notesZh = m.notesZh || null;
-            updateNotes();
-          }
-        } catch (e) {
-          console.error("notes refresh after rename failed:", e);
-        }
-      }
-      $("diarize-status").textContent = res.notesPatched
-        ? T("已更新：转写全部生效，笔记里 ${…} 处旧名字也一起改了", { "${…1}": res.notesPatched })
-        : T("已更新：转写全部生效（笔记里没有出现旧名字）");
-    };
-    input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); });
-    // NOT `commit` directly: addEventListener passes the EVENT as the first argument,
-    // and commit()'s first parameter is a value — the event object would be read as the
-    // name and coerced to "[object FocusEvent]".
-    input.addEventListener("blur", () => commit());
-
-    /* Roster picker.
-     *
-     * WHY: the attendee names are typed once in the participants modal, and then the
-     * speaker rows asked for them AGAIN with no connection between the two lists — you
-     * had to retype names you had just entered. This is a dropdown of the roster, so
-     * naming a voice is one click.
-     *
-     * It still does NOT auto-assign: diarization order is not roster order, and a wrong
-     * guess would misattribute everything that person said. You choose which name goes
-     * with the voice you just heard on ▶.
-     * Names already given to another speaker are not offered, so one person cannot be
-     * assigned to two rows by accident. */
-    const roster = (meetingParticipants || []).filter((n) => typeof n === "string" && n.trim());
-    if (roster.length) {
-      // rule lives in renderer/trackQuality.js (names already given to another speaker
-      // are not offered, so one person cannot be assigned to two rows by accident)
-      const options = TQ.pickableNames(roster, speakers, s.id);
-      const mine = String(s.name || "").trim();
-      if (options.length) {
-        const pick = document.createElement("select");
-        pick.className = "spk-pick compact";
-        pick.title = T("从参会人名单里选一个名字");
-        const ph = document.createElement("option");
-        ph.value = "";
-        ph.textContent = T("选参会人…");
-        pick.appendChild(ph);
-        for (const n of options) {
-          const o = document.createElement("option");
-          o.value = n;
-          o.textContent = n;
-          if (mine && n.trim().toLowerCase() === mine.toLowerCase()) o.selected = true;
-          pick.appendChild(o);
-        }
-        pick.addEventListener("change", () => { if (pick.value) commit(pick.value); });
-        row.append(pick);
-      }
-    }
-
-    const meta = document.createElement("span");
-    meta.className = "spk-meta";
-    meta.textContent = T("${…} 段 · ${…}", { "${…1}": s.segments, "${…2}": fmtDur(s.durationSec) }) + (s.lowConfidence ? T(" · ⚠样本短") : "");
-
-    row.append(play, label, input, meta);
-
-    if (speakers.length > 1) {
-      const merge = document.createElement("select");
-      merge.className = "spk-merge compact";
-      merge.title = T("把这一行合并到另一个发言人（修正过度切分）");
-      const o0 = document.createElement("option");
-      o0.value = "";
-      o0.textContent = T("合并到…");
-      merge.appendChild(o0);
-      for (const t of speakers) {
-        if (t.id === s.id) continue;
-        const o = document.createElement("option");
-        o.value = t.id;
-        o.textContent = t.name || t.id.replace(/^spk/, T("发言人"));
-        merge.appendChild(o);
-      }
-      merge.addEventListener("change", async () => {
-        const into = merge.value;
-        if (!into) return;
-        if (!confirm(T("把「${…}」的所有片段合并到「${…}」？", { "${…1}": s.name || s.id, "${…2}": (speakers.find((x) => x.id === into) || {}).name || into }))) {
-          merge.value = "";
-          return;
-        }
-        const res = await window.a2n.speakersMerge({ dir: currentDir, fromId: s.id, intoId: into });
-        if (res.error) { $("diarize-status").textContent = T("合并失败：") + res.error; return; }
-        speakers = res.speakers;
-        lastResult.chunks = res.chunks;
-        renderChunks();
-        renderSpeakerRows();
-        $("diarize-status").textContent = T("已合并。");
-      });
-      row.appendChild(merge);
-    }
-    box.appendChild(row);
+      if ($("diarize-status")) $("diarize-status").textContent = T("已合并。");
+    });
+    row.appendChild(merge);
   }
+
+  return { el: row, commit };
 }
 
 async function toggleAudition(s) {
@@ -1460,15 +1480,130 @@ async function toggleAudition(s) {
   auditionAudio = new Audio(r.dataUrl);
   auditionId = s.id;
   auditionAudio.onended = () => { auditionAudio = null; auditionId = null; renderSpeakerRows(); };
-  await auditionAudio.play().catch((e) => { $("diarize-status").textContent = T("播放失败：") + e.message; });
+  await auditionAudio.play().catch((e) => { if ($("diarize-status")) $("diarize-status").textContent = T("播放失败：") + e.message; });
   renderSpeakerRows();
 }
+
+/* ---- post-recording naming modal ---------------------------------------
+ * After the pipeline finishes with voices detected, this card lists every speaker
+ * with its ▶ 5-second clip and a name field, at the moment the user still remembers
+ * who was in the room. It is a convenience, not a gate: Escape / 「取消」 close it and
+ * change nothing, and the inline panel keeps working exactly as before. */
+/* Commit every row's CURRENT input value, then rewrite the notes so they carry the
+ * real names. A commit re-renders the inline panel on the way out, so the handles are
+ * re-collected from the live DOM each pass instead of once at open time; a row whose
+ * value did not change early-returns inside its own commit, so this stays cheap. */
+async function saveSpeakerConfirm() {
+  const btn = $("speaker-confirm-save");
+  if (btn) btn.disabled = true;
+  for (const s of speakers.slice()) {
+    confirmRowsById = collectConfirmRows();
+    const r = confirmRowsById.get(s.id);
+    if (r) await r.commit();
+  }
+  // reuses the Regenerate button's own status slot, so no new user-visible string
+  if ($("regen-status")) $("regen-status").textContent = T("重新生成中…");
+  const err = await regenNotesWithCurrentNames();
+  closeSpeakerConfirm();
+  renderChunks();
+  renderSpeakerRows();
+  if ($("regen-status")) {
+    $("regen-status").classList.toggle("warn", !!err);
+    $("regen-status").textContent = err ? T("失败：") + err : T("已重新生成 ✓");
+  }
+  if (!err) setTimeout(() => { if ($("regen-status")) $("regen-status").textContent = ""; }, 3000);
+}
+
+/* Shared by the modal's 保存 and the panel's 重新生成 button: the summarizer reads
+ * transcript.json, which speakersSetName rewrites, so renaming must be followed by a
+ * real regeneration for the names to appear in the notes. Returns an error string, or
+ * null on success. */
+async function regenNotesWithCurrentNames() {
+  const res = await window.a2n.regenerateNotes({
+    dir: currentDir,
+    detailLevel: $("detail-level").value,
+  });
+  if (res.error) return res.error;
+  if (lastResult) {
+    lastResult.notes = res.notes;
+    lastResult.notesZh = res.notesZh || null;
+  }
+  if ($("notes-provider")) $("notes-provider").textContent = res.provider || "";
+  updateNotes();
+  return null;
+}
+
+/* The rows currently mounted in #speaker-confirm-rows: speakerId -> built row. Rebuilt
+ * from the live DOM rather than cached, because a commit re-renders the inline panel and
+ * would otherwise leave the map pointing at detached nodes. */
+function collectConfirmRows() {
+  const map = new Map();
+  const box = $("speaker-confirm-rows");
+  if (!box) return map;
+  const els = [...box.querySelectorAll(".speaker-row")];
+  speakers.forEach((s, i) => {
+    const el = els[i];
+    if (el) map.set(s.id, { el, commit: () => commitRowValue(s, el) });
+  });
+  return map;
+}
+
+/* Fallback of the builder's own commit closure: commits the CURRENT value of a row that
+ * is still mounted, through the same speakersSetName path (the closure captured its
+ * input at build time, so a rebuilt row needs this one to be read live). */
+async function commitRowValue(s, el) {
+  const input = el.querySelector(".spk-name");
+  if (!input) return;
+  const v = String(input.value).trim();
+  if (v === (s.name || "")) return;
+  const res = await window.a2n.speakersSetName({ dir: currentDir, speakerId: s.id, name: v });
+  if (res.error) {
+    if ($("diarize-status")) $("diarize-status").textContent = T("改名失败：") + res.error;
+    return;
+  }
+  speakers = res.speakers;
+  if (lastResult) lastResult.chunks = res.chunks;
+  renderChunks();
+  renderSpeakerRows();
+}
+
+function openSpeakerConfirm() {
+  const box = $("speaker-confirm-rows");
+  box.innerHTML = "";
+  if (!speakers.length) return; // nothing detected — never show an empty card
+  for (const s of speakers) box.appendChild(buildSpeakerRow(s).el);
+  confirmRowsById = collectConfirmRows();
+  /* Save disables itself while the regeneration runs. Reset it on every open, or the
+   * next meeting's card comes up with a dead Save button — the auto-open guard is
+   * per-dir, so a second meeting in one app run does reopen this card. */
+  $("speaker-confirm-save").disabled = false;
+  $("speaker-confirm-overlay").hidden = false;
+  const first = box.querySelector(".spk-name");
+  if (first) first.focus();
+}
+
+function closeSpeakerConfirm() {
+  $("speaker-confirm-overlay").hidden = true;
+  confirmRowsById = new Map();
+  // hand focus back to the panel that owns this data, so the card never traps it
+  if ($("btn-diarize")) $("btn-diarize").focus();
+}
+
+$("speaker-confirm-save").addEventListener("click", saveSpeakerConfirm);
+$("speaker-confirm-skip").addEventListener("click", closeSpeakerConfirm);
+/* Escape = Skip (change nothing). A focused input is included on purpose — there is
+ * nothing to lose in this card, so any Escape closes it. */
+$("speaker-confirm-overlay").addEventListener("keydown", (ev) => {
+  if (ev.key !== "Escape") return;
+  ev.preventDefault();
+  closeSpeakerConfirm();
+});
 
 $("btn-diarize").addEventListener("click", async () => {
   if (!currentDir) return;
   const btn = $("btn-diarize");
   btn.disabled = true;
-  $("diarize-status").textContent = T("识别中…（本地 CPU，长会议需要几分钟）");
+  if ($("diarize-status")) $("diarize-status").textContent = T("识别中…（本地 CPU，长会议需要几分钟）");
   try {
     const res = await window.a2n.speakersDiarize({ dir: currentDir });
     if (res.error) {
@@ -1656,6 +1791,21 @@ window.a2n.onPipeline((p) => {
   $("pipeline").textContent = window.I18N ? window.I18N.resolve(lastPipeline) : lastPipeline;
   if (typeof p.progress === "number") setProgress(p.progress);
   if (p.phase === "done" || p.phase === "error") setProgress(p.phase === "done" ? 100 : 0);
+  /* Post-recording naming: diarization is already on disk by the time the pipeline
+   * reports "done", so this is the one moment the user is looking at the result AND
+   * still remembers who spoke. Auto-open at most ONCE per meeting per app run (a
+   * re-transcribe fires "done" again), and only when there are voices and none of them
+   * has a name yet — never re-ask a meeting that has been named. */
+  if (p.phase === "done" && p.dir && !speakerConfirmShown.has(p.dir)) {
+    speakerConfirmShown.add(p.dir); // added before the await: a second event cannot race in
+    const dir = p.dir;
+    loadSpeakers().then(() => {
+      if (dir !== currentDir) return; // the user opened another meeting while we loaded
+      if (speakers.length >= 1 && !speakers.some((s) => String(s.name || "").trim())) {
+        openSpeakerConfirm();
+      }
+    }).catch((e) => console.error("speaker naming prompt failed:", e));
+  }
 });
 window.a2n.onTranscript((t) => {
   if (lastResult) {

@@ -149,6 +149,31 @@ button.ghost { background: none; }
 .participants-card button.primary:disabled {
   background: var(--card2); border-color: var(--border); color: var(--muted); /* in flight, not merely faded */
 }
+/* post-recording naming modal: same geometry as the participants card, dismissible
+   (Escape / 取消 change nothing) because it is a convenience, not a must-answer moment */
+.speaker-confirm-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(8, 10, 14, .6);
+}
+.speaker-confirm-overlay[hidden] { display: none; }
+.speaker-confirm-card { width: 520px; max-width: calc(100vw - 32px); max-height: 84vh; overflow: auto; margin: 0; }
+.speaker-confirm-card h2 { overflow-wrap: anywhere; }
+/* The card's own overflow would scroll the buttons off screen with a long row list. */
+.speaker-confirm-rows { max-height: 46vh; overflow-y: auto; }
+.speaker-confirm-actions { margin-top: 12px; align-items: center; }
+.speaker-confirm-actions .status { margin-left: 8px; }
+.speaker-confirm-card button { transition: background-color .08s, border-color .08s, color .08s, transform .04s; }
+.speaker-confirm-card button:hover:not(:disabled) { border-color: var(--accent); }
+.speaker-confirm-card button:active:not(:disabled) {
+  background: var(--card); border-color: var(--accent); color: var(--accent);
+  transform: translateY(1px);
+}
+.speaker-confirm-card button.primary:active:not(:disabled) { background: var(--card2); color: var(--accent); }
+.speaker-confirm-card button:disabled { opacity: .5; cursor: progress; }
+.speaker-confirm-card button.primary:disabled {
+  background: var(--card2); border-color: var(--border); color: var(--muted); /* in flight, not merely faded */
+}
 .timer { font-variant-numeric: tabular-nums; font-size: 20px; color: var(--muted); margin-left: auto; }
 
 .status { min-height: 20px; margin-top: 8px; color: var(--muted); font-size: 13px; }
