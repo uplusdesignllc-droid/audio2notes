@@ -34,7 +34,13 @@
       "src/**",
       "renderer/**",
       "assets/**",
-      "package.json"
+      "package.json",
+      "!**/*.bak",
+      "!**/*.bak-*",
+      "!**/*.bak[0-9]",
+      "!**/*.orig",
+      "!**/*.tmp",
+      "!**/*.map"
     ],
     "asarUnpack": [
       "node_modules/ffmpeg-static/**",
@@ -43,9 +49,6 @@
       "assets/models/**"
     ],
     "npmRebuild": false,
-    "electronDownload": {
-      "cache": "C:/Users/lma/Documents/Cline/Workflows/audio to notes/.electron-builder-cache"
-    },
     "extraResources": [
       {
         "from": ".cap/capture.exe",
