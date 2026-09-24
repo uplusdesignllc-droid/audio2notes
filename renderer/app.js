@@ -1513,23 +1513,58 @@ function renderChunks() {
     badge.className = "speaker";
     badge.textContent = c.speakerName || T("说话人");
     badge.title = T("点击改名");
-    badge.addEventListener("click", async () => {
-      const name = prompt(T("为「${…}」设置名字：", { "${…1}": badge.textContent }), badge.textContent);
-      if (!name || !name.trim() || name.trim() === badge.textContent) return;
-      // prefer the STABLE id when the chunk has one: renaming by id never breaks,
-      // renaming by display string loses the link after the first change
-      const byId = typeof c.speaker === "string" && /^spk\d+$/.test(c.speaker);
-      const res = byId
-        ? await window.a2n.speakersSetName({ dir: currentDir, speakerId: c.speaker, name: name.trim() })
-        : await window.a2n.renameSpeaker({ dir: currentDir, from: badge.textContent, to: name.trim() });
-      if (res.ok) {
-        lastResult.chunks = res.chunks;
-        if (byId && res.speakers) { speakers = res.speakers; renderSpeakerRows(); }
-        renderChunks();
-        $("regen-status").textContent = T("说话人已更新 — 点「重新生成」刷新笔记里的归属。");
-      } else {
-        $("regen-status").textContent = T("改名失败：") + (res.error || "unknown");
-      }
+    /* Rename in place: Electron implements no window.prompt dialog, so the badge is swapped for a
+     * text input in the same slot. Enter commits, Escape/blur cancels, and the badge is
+     * restored either way. The input reuses the Speakers-panel `.spk-name` style — no
+     * new CSS and no new i18n key. */
+    badge.addEventListener("click", () => {
+      if (!badge.isConnected) return;
+      const oldName = badge.textContent;
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "spk-name";
+      input.value = oldName;
+      let done = false;
+      const restore = () => { if (input.isConnected) input.replaceWith(badge); };
+      /* Restores the badge on EVERY terminal outcome and reports the failure, so a rejected
+       * IPC call cannot leave a bare input where the speaker label used to be. */
+      const settle = async (res) => {
+        restore();
+        $("regen-status").textContent = T("改名失败：") + ((res && res.error) || "unknown");
+      };
+      const commit = async () => {
+        if (done) return;
+        done = true;
+        const name = input.value;
+        if (!name || !name.trim() || name.trim() === oldName) { restore(); return; }
+        // prefer the STABLE id when the chunk has one: renaming by id never breaks,
+        // renaming by display string loses the link after the first change
+        const byId = typeof c.speaker === "string" && /^spk\d+$/.test(c.speaker);
+        let res;
+        try {
+          res = byId
+            ? await window.a2n.speakersSetName({ dir: currentDir, speakerId: c.speaker, name: name.trim() })
+            : await window.a2n.renameSpeaker({ dir: currentDir, from: oldName, to: name.trim() });
+        } catch (e) { await settle({ error: e && e.message }); return; }
+        /* `ok` covers both IPC shapes: speakersSetName answers ok:true, renameSpeaker
+         * answers a bare {error} with no `ok` at all — so a missing `ok` means failure. */
+        if (res && res.ok) {
+          lastResult.chunks = res.chunks;
+          if (byId && res.speakers) { speakers = res.speakers; renderSpeakerRows(); }
+          renderChunks();
+          $("regen-status").textContent = T("说话人已更新 — 点「重新生成」刷新笔记里的归属。");
+        } else {
+          await settle(res);
+        }
+      };
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); commit(); }
+        else if (e.key === "Escape") { done = true; restore(); }
+      });
+      input.addEventListener("blur", () => { if (!done) { done = true; restore(); } });
+      badge.replaceWith(input);
+      input.focus();
+      input.select();
     });
 
     const time = document.createElement("span");
